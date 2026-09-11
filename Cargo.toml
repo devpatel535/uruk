@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/uruk"]
+
+# Shared metadata. Component crates (uruk-crawl, uruk-index, uruk-query,
+# uruk-serve) inherit from here as they are designed and added.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/devpatel535/uruk"
+homepage = "https://github.com/devpatel535/uruk"
+authors = ["The Uruk authors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allocation and I/O discipline matter here: the index has to stay small and
+# queries have to stay fast. Make the expensive things visible at review time.
+needless_pass_by_value = "warn"
+inefficient_to_string = "warn"
+
+# Release profile tuned for a search binary: one codegen unit and LTO buy
+# real query latency, and the build is small enough that the cost is fine.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# No panic = "abort": uruk-serve should catch a panic per request rather than
+# let one bad query take down the process.

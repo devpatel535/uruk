@@ -1,0 +1,21 @@
+[package]
+name = "uruk"
+description = "A search engine that returns links, not answers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "uruk"
+path = "src/main.rs"
+
+# No dependencies yet, and that is deliberate. Every crate added from here on
+# should be justified in the commit that adds it.
+[dependencies]
+
+[lints]
+workspace = true

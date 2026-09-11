@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Uruk working data. None of this belongs in git: crawl output and index
+# segments are large, machine-generated, and reproducible from a seed list.
+/data/
+/crawl/
+/index/
+*.uruk
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
