@@ -14,3 +14,10 @@
 *.swp
 .idea/
 .vscode/
+
+# Python bytecode from the Phase 0 probe tool
+__pycache__/
+*.pyc
+
+# Probe output
+/tools/crawlability-probe/results/

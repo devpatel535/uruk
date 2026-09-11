@@ -1,0 +1,54 @@
+# Science, maths and academic writing.
+# Expected to be the most crawlable of the three: static, text-heavy, stable
+# URLs, little commercial pressure. Includes publishers and .gov sites, which
+# are the likeliest to block.
+
+# --- individual academics and research blogs ---
+terrytao.wordpress.com
+scottaaronson.blog
+johndcook.com
+math.ucr.edu
+golem.ph.utexas.edu
+gowers.wordpress.com
+blog.computationalcomplexity.org
+quantumfrontiers.com
+statmodeling.stat.columbia.edu
+mathbabe.org
+backreaction.blogspot.com
+win-vector.com
+lesswrong.com
+inference-review.com
+
+# --- reference works ---
+plato.stanford.edu
+ncatlab.org
+oeis.org
+proofwiki.org
+encyclopediaofmath.org
+mathworld.wolfram.com
+arxiv.org
+biorxiv.org
+
+# --- university and institutional ---
+ocw.mit.edu
+web.mit.edu
+cs.cmu.edu
+people.csail.mit.edu
+math.stanford.edu
+ias.edu
+perimeterinstitute.ca
+cam.ac.uk
+ox.ac.uk
+
+# --- government science ---
+nasa.gov
+usgs.gov
+noaa.gov
+nist.gov
+ncbi.nlm.nih.gov
+
+# --- open-access publishers ---
+plos.org
+elifesciences.org
+nature.com
+science.org

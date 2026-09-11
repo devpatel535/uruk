@@ -817,12 +817,23 @@ make everything downstream easier. A subject where it has migrated to Discord,
 YouTube and newsletters will make the engine feel broken no matter how good the
 ranking is.
 
-To make that concrete rather than abstract, I can take two or three candidate
-areas and spend a day measuring them before we commit: sample a few hundred
-representative sites, check what fraction are crawlable (`robots.txt`,
-Cloudflare, proof-of-work walls), what fraction serve real text without
-JavaScript, and how densely they link to each other. That turns the decision
-into evidence instead of instinct. Say the word and I'll do that first.
+**You've asked to measure first, so the instrument exists**:
+[`tools/crawlability-probe/`](tools/crawlability-probe/). It takes 125
+hand-picked candidate domains across three areas — programming and technical,
+science and academic, practical and hobbyist — and reports, per area, what
+fraction are crawlable (`robots.txt` posture, Cloudflare, proof-of-work
+walls), what fraction serve real text without JavaScript, and how densely they
+link to one another. Two polite requests per domain, `robots.txt` obeyed,
+standard library only.
+
+The candidate lists deliberately include sites I expect to fail — big
+publishers, `.gov` domains, and several well-known SEO content farms in the
+practical list — because a sample that excludes them would make every area look
+healthier than it is.
+
+It has not been run yet: the environment this was written in has restricted
+outbound HTTPS, and behind such a proxy every domain scores as blocked. It
+needs one run from a normal connection. See the tool's README.
 
 **Then, in order, and only after that one is settled:** the launch scale
 (thousands vs. millions — §6 shows it changes the index format); where it runs;

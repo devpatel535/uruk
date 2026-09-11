@@ -1,0 +1,55 @@
+# Practical and hobbyist knowledge: cooking, repair, gardening, making,
+# astronomy, woodworking, photography.
+# This list deliberately includes several sites widely regarded as SEO content
+# farms. Excluding them would make the area look far healthier than it is —
+# measuring them is the point.
+
+# --- repair, electronics, making ---
+ifixit.com
+hackaday.com
+sparkfun.com
+learn.adafruit.com
+instructables.com
+makezine.com
+eevblog.com
+bigclive.com
+
+# --- cooking ---
+seriouseats.com
+kingarthurbaking.com
+smittenkitchen.com
+budgetbytes.com
+food52.com
+thekitchn.com
+altonbrown.com
+chefsteps.com
+cooksillustrated.com
+allrecipes.com
+
+# --- gardening ---
+finegardening.com
+rhs.org.uk
+missouribotanicalgarden.org
+extension.umn.edu
+gardeningknowhow.com
+davesgarden.com
+
+# --- astronomy ---
+cloudynights.com
+skyandtelescope.org
+astrobin.com
+in-the-sky.org
+
+# --- woodworking and home ---
+finewoodworking.com
+lumberjocks.com
+woodworkingtalk.com
+thisoldhouse.com
+familyhandyman.com
+
+# --- cycling, photography, other ---
+sheldonbrown.com
+bikeforums.net
+luminous-landscape.com
+dpreview.com
+photo.net

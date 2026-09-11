@@ -1,0 +1,57 @@
+# Programming & technical writing.
+# Mixed on purpose: individual blogs, project documentation, mailing-list
+# archives, community forums and wikis. The blogs flatter the numbers; the
+# forums and big docs sites are where the trouble usually is.
+
+# --- individual writers ---
+danluu.com
+jvns.ca
+fasterthanli.me
+matklad.github.io
+rachelbythebay.com
+nullprogram.com
+eli.thegreenplace.net
+blog.regehr.org
+lemire.me
+righto.com
+tratt.net
+brooker.co.za
+aphyr.com
+hillelwayne.com
+drewdevault.com
+ciechanow.ski
+simonwillison.net
+antirez.com
+preshing.com
+herbsutter.com
+joeduffyblog.com
+akkartik.name
+bactra.org
+yosefk.com
+
+# --- project documentation and reference ---
+lwn.net
+sqlite.org
+postgresql.org
+nginx.org
+openbsd.org
+man7.org
+gcc.gnu.org
+sourceware.org
+kernel.org
+doc.rust-lang.org
+docs.python.org
+go.dev
+perl.org
+gnu.org
+en.cppreference.com
+
+# --- wikis, forums, archives ---
+wiki.archlinux.org
+wiki.gentoo.org
+lore.kernel.org
+marc.info
+lobste.rs
+tildes.net
+stackoverflow.com
+github.blog
