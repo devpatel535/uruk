@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/uruk"]
+members = ["crates/uruk", "crates/uruk-crawl"]
 
 # Shared metadata. Component crates (uruk-crawl, uruk-index, uruk-query,
 # uruk-serve) inherit from here as they are designed and added.
@@ -25,6 +25,17 @@ pedantic = { level = "warn", priority = -1 }
 # queries have to stay fast. Make the expensive things visible at review time.
 needless_pass_by_value = "warn"
 inefficient_to_string = "warn"
+# Pedantic lints we deliberately switch off, with reasons:
+#   must_use_candidate    - would decorate nearly every accessor; noise
+#   module_name_repetitions - url::normalize_url reads better than url::normalize
+#   missing_errors_doc / missing_panics_doc - error types are self-describing
+#   cast_precision_loss   - scoring converts counts to f64 constantly and
+#                           deliberately; truncation lints stay on
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow"
 
 # Release profile tuned for a search binary: one codegen unit and LTO buy
 # real query latency, and the build is small enough that the cost is fine.
