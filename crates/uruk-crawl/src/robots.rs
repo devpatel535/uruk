@@ -75,7 +75,11 @@ impl Robots {
     }
 
     fn blanket(allowed: bool) -> Self {
-        Self { groups: Vec::new(), sitemaps: Vec::new(), blanket: Some(allowed) }
+        Self {
+            groups: Vec::new(),
+            sitemaps: Vec::new(),
+            blanket: Some(allowed),
+        }
     }
 
     /// Parse a `robots.txt` body.
@@ -95,7 +99,9 @@ impl Robots {
             if line.is_empty() {
                 continue;
             }
-            let Some((field, value)) = line.split_once(':') else { continue };
+            let Some((field, value)) = line.split_once(':') else {
+                continue;
+            };
             let field = field.trim().to_ascii_lowercase();
             let value = value.trim();
 
@@ -114,7 +120,10 @@ impl Robots {
                     // A rule before any `User-agent` line has no group; the
                     // conventional reading is that it applies to everyone.
                     if groups.is_empty() {
-                        groups.push(Group { agents: vec!["*".into()], ..Group::default() });
+                        groups.push(Group {
+                            agents: vec!["*".into()],
+                            ..Group::default()
+                        });
                     }
                     // `Disallow:` with an empty value means "nothing is
                     // disallowed" and must not become a rule matching "".
@@ -122,7 +131,10 @@ impl Robots {
                         continue;
                     }
                     if let Some(group) = groups.last_mut() {
-                        group.rules.push(Rule { allow: field == "allow", pattern: value.to_owned() });
+                        group.rules.push(Rule {
+                            allow: field == "allow",
+                            pattern: value.to_owned(),
+                        });
                     }
                 }
                 "crawl-delay" => {
@@ -140,7 +152,11 @@ impl Robots {
             }
         }
 
-        Self { groups, sitemaps, blanket: None }
+        Self {
+            groups,
+            sitemaps,
+            blanket: None,
+        }
     }
 
     /// The group that applies to `product_token`, most specific match winning.
@@ -202,7 +218,8 @@ impl Robots {
     /// Not part of RFC 9309, and Google ignores it. We honour it: a site that
     /// took the trouble to ask for a slower rate should get one.
     pub fn crawl_delay(&self, product_token: &str) -> Option<Duration> {
-        self.group_for(product_token).and_then(|group| group.crawl_delay)
+        self.group_for(product_token)
+            .and_then(|group| group.crawl_delay)
     }
 
     /// Sitemap URLs declared in the file. Good seed material.
@@ -226,7 +243,11 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     // No wildcard: a plain prefix test, or an exact one when anchored.
     if segments.len() == 1 {
         let only = segments[0];
-        return if anchored { path == only } else { path.starts_with(only) };
+        return if anchored {
+            path == only
+        } else {
+            path.starts_with(only)
+        };
     }
 
     let last = segments.len() - 1;
@@ -260,7 +281,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -304,7 +327,8 @@ mod tests {
 
     #[test]
     fn longest_matching_rule_wins() {
-        let robots = Robots::parse("User-agent: *\nDisallow: /private/\nAllow: /private/public.html");
+        let robots =
+            Robots::parse("User-agent: *\nDisallow: /private/\nAllow: /private/public.html");
         assert!(!robots.allows(US, "/private/secret.html"));
         assert!(robots.allows(US, "/private/public.html"));
     }
@@ -334,10 +358,12 @@ mod tests {
 
     #[test]
     fn a_named_group_beats_the_wildcard_group() {
-        let robots = Robots::parse(
-            "User-agent: *\nDisallow: /\n\nUser-agent: uruk-crawl\nDisallow: /admin",
+        let robots =
+            Robots::parse("User-agent: *\nDisallow: /\n\nUser-agent: uruk-crawl\nDisallow: /admin");
+        assert!(
+            robots.allows(US, "/page"),
+            "our own group should apply, not *"
         );
-        assert!(robots.allows(US, "/page"), "our own group should apply, not *");
         assert!(!robots.allows(US, "/admin"));
     }
 
@@ -377,7 +403,8 @@ mod tests {
 
     #[test]
     fn comments_and_blank_lines_are_ignored() {
-        let robots = Robots::parse("# leading comment\n\nUser-agent: *  # us\nDisallow: /x # why\n");
+        let robots =
+            Robots::parse("# leading comment\n\nUser-agent: *  # us\nDisallow: /x # why\n");
         assert!(!robots.allows(US, "/x"));
         assert!(robots.allows(US, "/y"));
     }

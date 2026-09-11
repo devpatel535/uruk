@@ -1,125 +1,293 @@
 //! `uruk` — the command-line entry point.
 //!
-//! The engine is built in phases, and this binary grows one subcommand per
-//! phase as each component is designed: `crawl`, `index`, `query`, `serve`.
-//! Right now it answers for itself and nothing else. That is on purpose — the
-//! scaffold exists so the workspace, the lint configuration and CI have
-//! something real to compile, lint and test before any engine code lands.
+//! One subcommand per component, added as each phase is built. `crawl` is
+//! here; `index`, `query` and `serve` follow.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
-const NAME: &str = env!("CARGO_PKG_NAME");
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use clap::{Parser, Subcommand};
+use url::Url;
+
+use uruk_crawl::crawler::{self, CrawlConfig, DEFAULT_USER_AGENT};
+use uruk_crawl::store::CrawlSummary;
+use uruk_crawl::traps::Limits;
 
 const TAGLINE: &str = "A search engine that returns links, not answers.";
 
-const USAGE: &str = "\
-Usage: uruk <command>
-
-Commands:
-  version    Print the version and exit
-  help       Print this message and exit
-
-No engine commands yet. See RESEARCH.md for what is being built and in
-what order.";
-
-/// What the argument list asked for.
-///
-/// Parsing is split out from `main` so the dispatch table can be tested
-/// without spawning a process.
-#[derive(Debug, PartialEq, Eq)]
-enum Command {
-    /// Print the version string.
-    Version,
-    /// Print usage. An empty invocation lands here too: asking `uruk`
-    /// what it is, is a question, not a mistake.
-    Help,
-    /// Something we do not recognise, carrying the offending argument.
-    Unknown(String),
+#[derive(Debug, Parser)]
+#[command(name = "uruk", version, about = TAGLINE, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-/// Map raw arguments (without the program name) onto a [`Command`].
-fn parse(args: &[String]) -> Command {
-    match args.first().map(String::as_str) {
-        Some("version" | "-V" | "--version") => Command::Version,
-        None | Some("help" | "-h" | "--help") => Command::Help,
-        Some(other) => Command::Unknown(other.to_owned()),
-    }
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Fetch pages politely, extract their text, and store it compressed.
+    Crawl(CrawlArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CrawlArgs {
+    /// File of seed URLs, one per line. Blank lines and `#` comments ignored.
+    #[arg(short, long, value_name = "FILE")]
+    seeds: PathBuf,
+
+    /// Directory to write the crawl store into.
+    #[arg(short, long, value_name = "DIR", default_value = "data/crawl")]
+    out: PathBuf,
+
+    /// Stop once this many pages have been stored.
+    #[arg(short = 'n', long, default_value_t = 1_000)]
+    max_pages: usize,
+
+    /// Seconds between requests to any one host.
+    ///
+    /// Lowering this is the single easiest way to get the crawler blocked.
+    #[arg(long, value_name = "SECONDS", default_value_t = 3.0)]
+    delay: f64,
+
+    /// Requests in flight at once, across *different* hosts. One host is never
+    /// asked for two things at the same time regardless of this value.
+    #[arg(short, long, default_value_t = 8)]
+    concurrency: usize,
+
+    /// How many links from a seed to follow.
+    #[arg(long, default_value_t = 4)]
+    max_depth: u32,
+
+    /// Most pages to take from any single host.
+    #[arg(long, default_value_t = 5_000)]
+    max_per_host: usize,
+
+    /// Override the user-agent. Keep a contact URL in it.
+    #[arg(long, default_value = DEFAULT_USER_AGENT)]
+    user_agent: String,
+
+    /// Suppress progress output.
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Crawl(args) => match run_crawl(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("uruk: {message}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
 
-    match parse(&args) {
-        Command::Version => {
-            println!("{NAME} {VERSION}");
-            ExitCode::SUCCESS
+/// Read a seed file: one URL per line, `#` comments and blank lines ignored.
+fn read_seeds(path: &PathBuf) -> Result<Vec<Url>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+
+    let mut seeds = Vec::new();
+    let mut rejected = Vec::new();
+    for (number, line) in raw.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
         }
-        Command::Help => {
-            println!("{NAME} {VERSION} — {TAGLINE}\n\n{USAGE}");
-            ExitCode::SUCCESS
+        match Url::parse(line) {
+            Ok(url) => seeds.push(url),
+            // A typo in a seed list should be named, not silently skipped:
+            // a seed that never loads is a whole branch of the crawl missing.
+            Err(error) => rejected.push(format!("  line {}: {line} ({error})", number + 1)),
         }
-        Command::Unknown(arg) => {
-            eprintln!("uruk: unknown command '{arg}'\n\n{USAGE}");
-            // 2 is the conventional exit code for a usage error.
-            ExitCode::from(2)
+    }
+
+    if !rejected.is_empty() {
+        return Err(format!("unusable seed URLs:\n{}", rejected.join("\n")));
+    }
+    if seeds.is_empty() {
+        return Err(format!("{} contains no seed URLs", path.display()));
+    }
+    Ok(seeds)
+}
+
+fn run_crawl(args: CrawlArgs) -> Result<(), String> {
+    let seeds = read_seeds(&args.seeds)?;
+
+    if args.delay < 1.0 {
+        // Not refused — the local test server in this repo's own tests needs a
+        // shorter one — but never let it pass unremarked.
+        eprintln!(
+            "uruk: warning: a {:.1}s delay is faster than one request per second per host. \
+             Do not point this at someone else's site.",
+            args.delay
+        );
+    }
+
+    let config = CrawlConfig {
+        seeds,
+        out_dir: args.out.clone(),
+        max_pages: args.max_pages,
+        limits: Limits {
+            max_depth: args.max_depth,
+            max_pages_per_host: args.max_per_host,
+            ..Limits::default()
+        },
+        host_delay: Duration::from_secs_f64(args.delay.max(0.0)),
+        concurrency: args.concurrency.max(1),
+        user_agent: args.user_agent,
+        progress: !args.quiet,
+    };
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("could not start the async runtime: {error}"))?;
+    let summary = runtime
+        .block_on(crawler::run(config))
+        .map_err(|error| format!("crawl failed: {error}"))?;
+
+    report(&summary, &args.out);
+    Ok(())
+}
+
+/// Print what happened, in the order someone operating a crawl cares about.
+fn report(summary: &CrawlSummary, out: &Path) {
+    let elapsed = summary.finished_at.saturating_sub(summary.started_at);
+    println!("\ncrawl finished in {elapsed}s");
+    println!("  pages stored       {}", summary.pages_stored);
+    println!("  pages fetched      {}", summary.pages_fetched);
+    println!("  hosts seen         {}", summary.hosts);
+    println!("  urls seen          {}", summary.urls_seen);
+    println!("  near-duplicates    {}", summary.near_duplicates);
+    println!("  robots disallowed  {}", summary.robots_disallowed);
+    println!("  noindex / noarchive{:>4}", summary.noindex);
+    println!("  fetch failures     {}", summary.fetch_failures);
+
+    if !summary.failures.is_empty() {
+        println!("\n  why fetches failed");
+        for (reason, count) in &summary.failures {
+            println!("    {reason:<20} {count}");
         }
+    }
+
+    // Refusals are the number RESEARCH.md section 5.1 actually wants: how much
+    // of what we found was worth fetching at all.
+    let refused: usize = summary.refusals.values().sum();
+    if refused > 0 {
+        println!("\n  why urls were refused");
+        for (reason, count) in summary.refusals.iter().filter(|(_, count)| **count > 0) {
+            println!("    {reason:<20} {count}");
+        }
+    }
+
+    if summary.text_bytes > 0 {
+        let ratio = summary.bytes_written as f64 / summary.text_bytes as f64;
+        println!("\n  text extracted     {}", human_bytes(summary.text_bytes));
+        println!(
+            "  store on disk      {}  ({:.0}% of the text, {:.1}x compression)",
+            human_bytes(summary.bytes_written),
+            ratio * 100.0,
+            1.0 / ratio
+        );
+        if summary.pages_stored > 0 {
+            println!(
+                "  bytes per page     {:.0}",
+                summary.bytes_written as f64 / summary.pages_stored as f64
+            );
+        }
+    }
+    println!("\nwritten to {}", out.display());
+}
+
+/// Bytes at a scale a person can read. A first crawl of a few hundred pages
+/// would otherwise report "0.0 MB" for everything it did.
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes / KB)
+    } else {
+        format!("{bytes:.0} B")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, NAME, TAGLINE, USAGE, VERSION, parse};
+    use super::{Cli, read_seeds};
+    use clap::Parser;
 
-    fn args(raw: &[&str]) -> Vec<String> {
-        raw.iter().map(|s| (*s).to_owned()).collect()
+    #[test]
+    fn the_cli_definition_is_valid() {
+        // clap can only catch a malformed command definition at runtime.
+        <Cli as clap::CommandFactory>::command().debug_assert();
     }
 
     #[test]
-    fn no_arguments_is_help_not_an_error() {
-        assert_eq!(parse(&args(&[])), Command::Help);
-    }
-
-    #[test]
-    fn version_is_reachable_by_every_spelling() {
-        for spelling in ["version", "-V", "--version"] {
-            assert_eq!(
-                parse(&args(&[spelling])),
-                Command::Version,
-                "spelling: {spelling}"
-            );
-        }
-    }
-
-    #[test]
-    fn help_is_reachable_by_every_spelling() {
-        for spelling in ["help", "-h", "--help"] {
-            assert_eq!(
-                parse(&args(&[spelling])),
-                Command::Help,
-                "spelling: {spelling}"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_command_is_reported_verbatim() {
-        assert_eq!(
-            parse(&args(&["crawl"])),
-            Command::Unknown("crawl".to_owned())
+    fn crawl_parses_with_only_a_seed_file() {
+        let cli = Cli::parse_from(["uruk", "crawl", "--seeds", "seeds.txt"]);
+        let super::Command::Crawl(args) = cli.command;
+        assert_eq!(args.seeds.to_str(), Some("seeds.txt"));
+        assert_eq!(args.max_pages, 1_000);
+        assert!(
+            args.delay >= 1.0,
+            "the default delay must not be aggressive"
         );
     }
 
-    #[test]
-    fn first_argument_wins() {
-        assert_eq!(parse(&args(&["version", "help"])), Command::Version);
+    fn write(contents: &str, name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("uruk-seeds-{}-{name}", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
     }
 
     #[test]
-    fn identity_strings_are_populated() {
-        assert_eq!(NAME, "uruk");
-        assert!(!VERSION.is_empty());
-        assert!(TAGLINE.contains("links, not answers"));
-        assert!(USAGE.contains("Usage: uruk"));
+    fn seed_files_ignore_comments_and_blank_lines() {
+        let path = write(
+            "# a comment\n\nhttps://a.test/\n  https://b.test/page  # trailing\n",
+            "ok",
+        );
+        let seeds = read_seeds(&path).unwrap();
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].as_str(), "https://a.test/");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_malformed_seed_is_named_rather_than_skipped() {
+        // Silently dropping a seed loses a whole branch of the crawl.
+        let path = write("https://a.test/\nnot a url\n", "bad");
+        let error = read_seeds(&path).unwrap_err();
+        assert!(error.contains("line 2"), "error was: {error}");
+        assert!(error.contains("not a url"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_empty_seed_file_is_an_error() {
+        let path = write("# nothing but comments\n", "empty");
+        assert!(read_seeds(&path).unwrap_err().contains("no seed URLs"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bytes_are_reported_at_a_readable_scale() {
+        use super::human_bytes;
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn a_missing_seed_file_is_reported_clearly() {
+        let path = std::path::PathBuf::from("/nonexistent/uruk/seeds.txt");
+        assert!(read_seeds(&path).unwrap_err().contains("could not read"));
     }
 }

@@ -32,27 +32,88 @@ use crate::url::{self as urlnorm, Rejected};
 /// code to the text.
 const CUT_TAGS: &[&str] = &[
     "script", "style", "noscript", "template", "nav", "header", "footer", "aside", "form",
-    "iframe", "svg", "canvas", "button", "select", "textarea", "menu", "dialog", "object",
-    "embed", "video", "audio", "map", "picture",
+    "iframe", "svg", "canvas", "button", "select", "textarea", "menu", "dialog", "object", "embed",
+    "video", "audio", "map", "picture",
 ];
 
 /// Class and id tokens that mark a container as furniture. Matched against
 /// whole tokens, never as substrings — "commentary" must not be cut because it
 /// contains "comment".
 const BOILERPLATE_TOKENS: &[&str] = &[
-    "nav", "navbar", "navigation", "menu", "sidebar", "side", "footer", "header", "masthead",
-    "comment", "comments", "disqus", "related", "recommended", "share", "sharing", "social",
-    "advert", "advertisement", "ads", "ad", "promo", "promotion", "sponsor", "sponsored",
-    "cookie", "cookies", "consent", "banner", "popup", "modal", "overlay", "newsletter",
-    "subscribe", "signup", "breadcrumb", "breadcrumbs", "pagination", "pager", "widget",
-    "toolbar", "skip", "screen-reader", "sr-only", "visually-hidden", "copyright", "legal",
+    "nav",
+    "navbar",
+    "navigation",
+    "menu",
+    "sidebar",
+    "side",
+    "footer",
+    "header",
+    "masthead",
+    "comment",
+    "comments",
+    "disqus",
+    "related",
+    "recommended",
+    "share",
+    "sharing",
+    "social",
+    "advert",
+    "advertisement",
+    "ads",
+    "ad",
+    "promo",
+    "promotion",
+    "sponsor",
+    "sponsored",
+    "cookie",
+    "cookies",
+    "consent",
+    "banner",
+    "popup",
+    "modal",
+    "overlay",
+    "newsletter",
+    "subscribe",
+    "signup",
+    "breadcrumb",
+    "breadcrumbs",
+    "pagination",
+    "pager",
+    "widget",
+    "toolbar",
+    "skip",
+    "screen-reader",
+    "sr-only",
+    "visually-hidden",
+    "copyright",
+    "legal",
 ];
 
 /// Tags after which a newline is inserted, so that extracted text keeps
 /// sentence and paragraph boundaries instead of running words together.
 const BLOCK_TAGS: &[&str] = &[
-    "p", "div", "section", "article", "main", "li", "tr", "br", "h1", "h2", "h3", "h4", "h5",
-    "h6", "blockquote", "pre", "td", "th", "dd", "dt", "figcaption", "hr",
+    "p",
+    "div",
+    "section",
+    "article",
+    "main",
+    "li",
+    "tr",
+    "br",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "blockquote",
+    "pre",
+    "td",
+    "th",
+    "dd",
+    "dt",
+    "figcaption",
+    "hr",
 ];
 
 fn selector(spec: &str) -> Selector {
@@ -69,7 +130,8 @@ static BODY: LazyLock<Selector> = LazyLock::new(|| selector("body"));
 static CANDIDATE: LazyLock<Selector> =
     LazyLock::new(|| selector("article, main, div, section, [role=main]"));
 static SCRIPT: LazyLock<Selector> = LazyLock::new(|| selector("script"));
-static CUT_SET: LazyLock<HashSet<&'static str>> = LazyLock::new(|| CUT_TAGS.iter().copied().collect());
+static CUT_SET: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| CUT_TAGS.iter().copied().collect());
 static BLOCK_SET: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| BLOCK_TAGS.iter().copied().collect());
 static BOILERPLATE_SET: LazyLock<HashSet<&'static str>> =
@@ -102,7 +164,13 @@ pub struct Directives {
 
 impl Default for Directives {
     fn default() -> Self {
-        Self { index: true, follow: true, archive: true, snippet: true, max_snippet: None }
+        Self {
+            index: true,
+            follow: true,
+            archive: true,
+            snippet: true,
+            max_snippet: None,
+        }
     }
 }
 
@@ -203,7 +271,11 @@ pub fn parse(html: &str, base: &Url, header_directives: Directives) -> Page {
 
     let mut directives = header_directives;
     for meta in document.select(&META) {
-        let name = meta.value().attr("name").unwrap_or_default().to_ascii_lowercase();
+        let name = meta
+            .value()
+            .attr("name")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         // `robots` addresses every crawler; our own product token addresses us
         // specifically and wins where both are present.
         if (name == "robots" || name == "uruk-crawl")
@@ -255,7 +327,16 @@ pub fn parse(html: &str, base: &Url, header_directives: Directives) -> Page {
         words,
     };
 
-    Page { title, text, headings, links, lang, canonical, directives, quality }
+    Page {
+        title,
+        text,
+        headings,
+        links,
+        lang,
+        canonical,
+        directives,
+        quality,
+    }
 }
 
 fn collect_links(document: &Html, base: &Url) -> Vec<Link> {
@@ -263,7 +344,9 @@ fn collect_links(document: &Html, base: &Url) -> Vec<Link> {
     let mut seen = HashSet::new();
 
     for anchor in document.select(&ANCHOR) {
-        let Some(href) = anchor.value().attr("href") else { continue };
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
         let url = match urlnorm::resolve(base, href) {
             Ok(url) => url,
             Err(Rejected::NotWebScheme | Rejected::NoHost | Rejected::TooLong) => continue,
@@ -271,7 +354,11 @@ fn collect_links(document: &Html, base: &Url) -> Vec<Link> {
         if !seen.insert(url.to_string()) {
             continue;
         }
-        let rel = anchor.value().attr("rel").unwrap_or_default().to_ascii_lowercase();
+        let rel = anchor
+            .value()
+            .attr("rel")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         links.push(Link {
             url,
             anchor: squeeze(&anchor.text().collect::<String>()),
@@ -377,9 +464,13 @@ fn extract_article(document: &Html) -> (String, f64) {
         }
     }
 
-    let chosen = best.map(|(_, element)| element).or_else(|| document.select(&BODY).next());
+    let chosen = best
+        .map(|(_, element)| element)
+        .or_else(|| document.select(&BODY).next());
 
-    let Some(element) = chosen else { return (String::new(), 0.0) };
+    let Some(element) = chosen else {
+        return (String::new(), 0.0);
+    };
     let text = subtree_text(element);
     let words = text.split_whitespace().count();
     let density = if words == 0 {
@@ -464,18 +555,35 @@ mod tests {
     fn extracts_the_article_and_drops_the_chrome() {
         let page = parse(BLOG_POST, &base(), Directives::default());
 
-        assert!(page.text.contains("counting sheep"), "article body missing: {:?}", page.text);
+        assert!(
+            page.text.contains("counting sheep"),
+            "article body missing: {:?}",
+            page.text
+        );
         assert!(page.text.contains("footnote to it"));
 
-        for chrome in ["Privacy policy", "Related posts", "Assyrian trade routes", "First!", "Terms"] {
-            assert!(!page.text.contains(chrome), "chrome leaked into text: {chrome}");
+        for chrome in [
+            "Privacy policy",
+            "Related posts",
+            "Assyrian trade routes",
+            "First!",
+            "Terms",
+        ] {
+            assert!(
+                !page.text.contains(chrome),
+                "chrome leaked into text: {chrome}"
+            );
         }
     }
 
     #[test]
     fn never_includes_script_contents() {
         let page = parse(BLOG_POST, &base(), Directives::default());
-        assert!(!page.text.contains("track"), "script body leaked: {:?}", page.text);
+        assert!(
+            !page.text.contains("track"),
+            "script body leaked: {:?}",
+            page.text
+        );
     }
 
     #[test]
@@ -483,13 +591,20 @@ mod tests {
         let page = parse(BLOG_POST, &base(), Directives::default());
         assert_eq!(page.title, "Clay tablets and the invention of the receipt");
         assert_eq!(page.lang.as_deref(), Some("en-gb"));
-        assert_eq!(page.canonical.unwrap().as_str(), "https://a.test/blog/clay-tablets");
+        assert_eq!(
+            page.canonical.unwrap().as_str(),
+            "https://a.test/blog/clay-tablets"
+        );
     }
 
     #[test]
     fn collects_headings_for_field_weighting() {
         let page = parse(BLOG_POST, &base(), Directives::default());
-        assert!(page.headings.iter().any(|h| h.contains("invention of the receipt")));
+        assert!(
+            page.headings
+                .iter()
+                .any(|h| h.contains("invention of the receipt"))
+        );
     }
 
     #[test]
@@ -505,7 +620,11 @@ mod tests {
     #[test]
     fn resolves_relative_links_and_keeps_anchor_text() {
         let page = parse(BLOG_POST, &base(), Directives::default());
-        let link = page.links.iter().find(|l| l.url.path() == "/blog/cuneiform").unwrap();
+        let link = page
+            .links
+            .iter()
+            .find(|l| l.url.path() == "/blog/cuneiform")
+            .unwrap();
         assert_eq!(link.anchor, "notes on cuneiform");
         assert!(!link.nofollow);
     }
@@ -526,7 +645,13 @@ mod tests {
             <a href="/c" rel="sponsored noopener">c</a>
             <a href="/d" rel="noopener">d</a></body></html>"#;
         let page = parse(html, &base(), Directives::default());
-        let flag = |path: &str| page.links.iter().find(|l| l.url.path() == path).unwrap().nofollow;
+        let flag = |path: &str| {
+            page.links
+                .iter()
+                .find(|l| l.url.path() == path)
+                .unwrap()
+                .nofollow
+        };
         assert!(flag("/a") && flag("/b") && flag("/c"));
         assert!(!flag("/d"), "noopener is not a nofollow");
     }
@@ -608,7 +733,11 @@ mod tests {
             as the word we filter on, and which must therefore survive extraction
             entirely intact for this test to pass at all.</p></div></body></html>"#;
         let page = parse(html, &base(), Directives::default());
-        assert!(page.text.contains("genuine writing"), "got: {:?}", page.text);
+        assert!(
+            page.text.contains("genuine writing"),
+            "got: {:?}",
+            page.text
+        );
     }
 
     #[test]
@@ -632,7 +761,11 @@ mod tests {
         assert!(page.quality.words > 50, "words: {}", page.quality.words);
         assert!(page.quality.text_ratio > 0.0 && page.quality.text_ratio < 1.0);
         // The article is prose, so few of its words are inside links.
-        assert!(page.quality.link_density < 0.2, "density: {}", page.quality.link_density);
+        assert!(
+            page.quality.link_density < 0.2,
+            "density: {}",
+            page.quality.link_density
+        );
     }
 
     #[test]
@@ -640,11 +773,18 @@ mod tests {
         use std::fmt::Write as _;
         let mut html = String::from("<html><body><div class='main'>");
         for i in 0..60 {
-            let _ = write!(html, "<a href='/p{i}'>cheap discount product number {i}</a> ");
+            let _ = write!(
+                html,
+                "<a href='/p{i}'>cheap discount product number {i}</a> "
+            );
         }
         html.push_str("</div></body></html>");
         let page = parse(&html, &base(), Directives::default());
-        assert!(page.quality.link_density > 0.8, "density: {}", page.quality.link_density);
+        assert!(
+            page.quality.link_density > 0.8,
+            "density: {}",
+            page.quality.link_density
+        );
     }
 
     #[test]

@@ -14,36 +14,55 @@
 //!
 //! The lookup trick is the other half of their paper. Comparing a new
 //! fingerprint against every stored one is quadratic and hopeless at scale.
-//! Instead, split the 64 bits into four 16-bit blocks: if two fingerprints
-//! differ in at most 3 bits, then by the pigeonhole principle at least one of
-//! the four blocks must be **identical**. So we keep four hash maps, look the
-//! new fingerprint's blocks up in each, and only compare against that handful
-//! of candidates.
+//! Instead, split the 64 bits into [`BLOCKS`] equal blocks: if two
+//! fingerprints differ in fewer bits than there are blocks, then by the
+//! pigeonhole principle at least one block must be **identical**. So we keep
+//! one hash map per block, look the new fingerprint's blocks up in each, and
+//! only compare against that handful of candidates.
 //!
-//! # Document length matters, and the threshold assumes it
+//! That argument requires the threshold to be strictly less than the number of
+//! blocks, which is why [`BLOCKS`] is 8 rather than Manku's 4: it is what
+//! allows a threshold above 3 while keeping the lookup exact rather than
+//! merely likely.
 //!
-//! A fingerprint summarises the *balance of evidence* across a document, so it
-//! is only stable when there is enough evidence. Measured on this
-//! implementation, the bit distance produced by changing a single word:
+//! # Choosing the threshold, from measurement
 //!
-//! | document | 1-word edit |
+//! Manku's threshold of 3 was calibrated for 8 billion pages, where a false
+//! positive is expensive and documents carried richer weighted features. At
+//! our scale it is too tight, and measuring on real prose says so plainly.
+//! Distances observed by `tests/calibrate.rs` on 200–255-word articles:
+//!
+//! | change | bit distance |
 //! |---|---|
-//! | 20 words | 13 bits |
-//! | 50 words | 7 bits |
-//! | 100 words | 4 bits |
-//! | 200 words | 2 bits |
-//! | 1,000 words | 2 bits |
+//! | byte-identical | 0 |
+//! | navigation header added | 2 |
+//! | footer added | 4 |
+//! | truncated by 1% / 5% / 10% | 2 / 5 / 7 |
+//! | one word changed (median / p95 / max) | 2–4 / 5–7 / 10 |
+//! | **unrelated documents (min over 40 pairs)** | **28** |
 //!
-//! So a threshold of 3 does what it promises on real articles and is close to
-//! meaningless on a stub. This produces *false negatives* on short pages (a
-//! reworded stub is not recognised as a duplicate), never false positives: two
-//! unrelated documents sit around 32 bits apart at any length. Callers that
-//! care should prefer [`MIN_RELIABLE_WORDS`] over trusting a short match.
+//! The two populations are far apart: near-duplicates land under about 10
+//! bits, unrelated documents never came closer than 28. A threshold of 3 sits
+//! so low that a page which merely gained a footer is treated as new content.
+//! [`DEFAULT_THRESHOLD`] is therefore 6 — above every realistic mirror,
+//! reprint and truncation, and with a wide margin below 28.
+//!
+//! The errors are not symmetric and the threshold is biased accordingly. A
+//! false negative indexes a mirror twice, which wastes a result slot. A false
+//! positive silently discards a genuine document, which is much worse and
+//! cannot be noticed after the fact.
+//!
+//! Short documents remain noisy — the fingerprint summarises a balance of
+//! evidence, and a stub has little evidence to balance — so
+//! [`MIN_RELIABLE_WORDS`] records the length below which only near-exact
+//! matches should be trusted.
 
 use std::collections::HashMap;
 
 /// Bit differences allowed before two documents count as distinct.
-pub const DEFAULT_THRESHOLD: u32 = 3;
+///
+/// Derived from measurement rather than inherited; see the module docs.
+pub const DEFAULT_THRESHOLD: u32 = 6;
 
 /// Below this many words, only near-exact matches are detected. See the
 /// module docs: this is a property of the algorithm, not a tunable.
@@ -71,7 +90,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Split text into lowercase alphanumeric words.
 fn words(text: &str) -> Vec<&str> {
-    text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect()
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect()
 }
 
 /// Compute the 64-bit `SimHash` fingerprint of a document's text.
@@ -94,7 +115,11 @@ pub fn fingerprint(text: &str) -> u64 {
 
     // A document shorter than one shingle still deserves a fingerprint, so fall
     // back to hashing its words individually.
-    let windows = if words.len() >= SHINGLE { words.len() - SHINGLE + 1 } else { 1 };
+    let windows = if words.len() >= SHINGLE {
+        words.len() - SHINGLE + 1
+    } else {
+        1
+    };
     for start in 0..windows {
         buffer.clear();
         let end = (start + SHINGLE).min(words.len());
@@ -132,12 +157,27 @@ pub fn distance(a: u64, b: u64) -> u32 {
 }
 
 /// Blocks the fingerprint is split into for candidate lookup.
-const BLOCKS: usize = 4;
-const BLOCK_BITS: u32 = 16;
-const BLOCK_MASK: u64 = 0xFFFF;
+///
+/// The pigeonhole argument in the module docs holds only while the threshold
+/// is strictly less than this, so raising the threshold means raising this
+/// too. [`SeenFingerprints::with_threshold`] enforces the relationship.
+/// Largest threshold the block lookup stays exact for: one less than
+/// [`BLOCKS`], by the pigeonhole argument above.
+pub const MAX_EXACT_THRESHOLD: u32 = 7;
+
+pub const BLOCKS: usize = MAX_EXACT_THRESHOLD as usize + 1;
+const BLOCK_BITS: u32 = 8;
+const BLOCK_MASK: u64 = (1 << BLOCK_BITS) - 1;
+
+// The blocks must tile the fingerprint exactly, or some bits would never be
+// looked at and the pigeonhole guarantee would quietly stop holding.
+const _: () = assert!(BLOCKS * (BLOCK_BITS as usize) == 64);
 
 fn block(fingerprint: u64, index: usize) -> u64 {
-    #[expect(clippy::cast_possible_truncation, reason = "index < BLOCKS, so the shift fits")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "index < BLOCKS, so the shift fits"
+    )]
     let shift = (index as u32) * BLOCK_BITS;
     (fingerprint >> shift) & BLOCK_MASK
 }
@@ -156,15 +196,29 @@ impl SeenFingerprints {
         Self::with_threshold(DEFAULT_THRESHOLD)
     }
 
+    /// Build with a specific threshold.
+    ///
+    /// # Panics
+    ///
+    /// Panics above [`MAX_EXACT_THRESHOLD`]. Past that the block lookup would
+    /// start missing duplicates without saying so, and a deduplicator that
+    /// quietly stops deduplicating is worse than one that refuses to start.
     pub fn with_threshold(threshold: u32) -> Self {
-        Self { threshold, ..Self::default() }
+        assert!(
+            threshold <= MAX_EXACT_THRESHOLD,
+            "threshold {threshold} exceeds {MAX_EXACT_THRESHOLD}; raise BLOCKS to go higher"
+        );
+        Self {
+            threshold,
+            ..Self::default()
+        }
     }
 
     /// Find an already-seen fingerprint within the threshold, if any.
     ///
-    /// Only fingerprints sharing at least one 16-bit block are compared, which
-    /// is sound for thresholds up to 3: with only 3 bits free to differ across
-    /// 4 blocks, one block must be untouched.
+    /// Only fingerprints sharing at least one block are compared, which is
+    /// exact while the threshold is below [`BLOCKS`]: with fewer differing
+    /// bits than blocks, some block must be untouched.
     pub fn find_near(&self, fingerprint: u64) -> Option<u64> {
         if fingerprint == 0 {
             return None;
@@ -192,7 +246,10 @@ impl SeenFingerprints {
         let position = self.fingerprints.len();
         self.fingerprints.push(fingerprint);
         for index in 0..BLOCKS {
-            self.buckets[index].entry(block(fingerprint, index)).or_default().push(position);
+            self.buckets[index]
+                .entry(block(fingerprint, index))
+                .or_default()
+                .push(position);
         }
         true
     }
@@ -229,12 +286,47 @@ mod tests {
     /// explicit about the document length they depend on.
     fn article(words: usize) -> String {
         const VOCAB: [&str; 36] = [
-            "the", "tablet", "of", "uruk", "records", "grain", "and", "debt", "a", "scribe",
-            "pressed", "reed", "into", "wet", "clay", "then", "dried", "it", "in", "sun",
-            "what", "survives", "is", "not", "literature", "but", "bookkeeping", "which",
-            "outlasted", "every", "empire", "that", "produced", "them", "over", "centuries",
+            "the",
+            "tablet",
+            "of",
+            "uruk",
+            "records",
+            "grain",
+            "and",
+            "debt",
+            "a",
+            "scribe",
+            "pressed",
+            "reed",
+            "into",
+            "wet",
+            "clay",
+            "then",
+            "dried",
+            "it",
+            "in",
+            "sun",
+            "what",
+            "survives",
+            "is",
+            "not",
+            "literature",
+            "but",
+            "bookkeeping",
+            "which",
+            "outlasted",
+            "every",
+            "empire",
+            "that",
+            "produced",
+            "them",
+            "over",
+            "centuries",
         ];
-        (0..words).map(|i| VOCAB[(i * 7 + i / 11) % VOCAB.len()]).collect::<Vec<_>>().join(" ")
+        (0..words)
+            .map(|i| VOCAB[(i * 7 + i / 11) % VOCAB.len()])
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -247,7 +339,10 @@ mod tests {
     fn fingerprints_are_stable_across_runs() {
         // Pinned so that a change to the hash function is caught here rather
         // than by silently invalidating every fingerprint already on disk.
-        assert_eq!(fingerprint("the quick brown fox"), 2_600_275_743_550_894_345);
+        assert_eq!(
+            fingerprint("the quick brown fox"),
+            2_600_275_743_550_894_345
+        );
     }
 
     #[test]
@@ -260,7 +355,10 @@ mod tests {
         let original = article(MIN_RELIABLE_WORDS);
         let edited = original.replacen("grain", "barley", 1);
         let moved = distance(fingerprint(&original), fingerprint(&edited));
-        assert!(moved <= DEFAULT_THRESHOLD, "a one-word edit moved {moved} bits");
+        assert!(
+            moved <= DEFAULT_THRESHOLD,
+            "a one-word edit moved {moved} bits"
+        );
     }
 
     #[test]
@@ -270,18 +368,25 @@ mod tests {
         let original = article(20);
         let edited = original.replacen("grain", "barley", 1);
         let moved = distance(fingerprint(&original), fingerprint(&edited));
-        assert!(moved > DEFAULT_THRESHOLD, "expected a short document to be noisy, moved {moved}");
+        assert!(
+            moved > DEFAULT_THRESHOLD,
+            "expected a short document to be noisy, moved {moved}"
+        );
     }
 
     #[test]
     fn unrelated_text_is_far_away_at_any_length() {
         // The failure mode we must never have is a false positive.
         for words in [20usize, 100, 500] {
-            let other: String = std::iter::repeat_n("borrow checker lifetimes generics traits", words / 5)
-                .collect::<Vec<_>>()
-                .join(" ");
+            let other: String =
+                std::iter::repeat_n("borrow checker lifetimes generics traits", words / 5)
+                    .collect::<Vec<_>>()
+                    .join(" ");
             let moved = distance(fingerprint(&article(words)), fingerprint(&other));
-            assert!(moved > DEFAULT_THRESHOLD, "{words} words: unrelated text only {moved} bits apart");
+            assert!(
+                moved > DEFAULT_THRESHOLD,
+                "{words} words: unrelated text only {moved} bits apart"
+            );
         }
     }
 
@@ -366,8 +471,14 @@ mod tests {
         }
         for i in 0..500u64 {
             let probe = fingerprint(&format!("document number {i}: {}", article(60)));
-            let brute = stored.iter().any(|&s| distance(probe, s) <= DEFAULT_THRESHOLD);
-            assert_eq!(seen.find_near(probe).is_some(), brute, "disagreement at {i}");
+            let brute = stored
+                .iter()
+                .any(|&s| distance(probe, s) <= DEFAULT_THRESHOLD);
+            assert_eq!(
+                seen.find_near(probe).is_some(),
+                brute,
+                "disagreement at {i}"
+            );
         }
     }
 }

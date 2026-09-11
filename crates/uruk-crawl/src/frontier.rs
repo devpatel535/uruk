@@ -18,8 +18,8 @@
 //! deliberately narrow so the move to an on-disk `CrawlDb` is a change behind
 //! this interface rather than through the whole crawler.
 
-use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use url::Url;
@@ -51,7 +51,9 @@ pub enum Next {
     Ready(Candidate),
     /// Nothing is eligible yet; every host is inside its delay. Sleep this long.
     Wait(Duration),
-    /// Nothing queued anywhere. The crawl is finished.
+    /// Nothing can be handed out: every queue is empty, blocked, or has a
+    /// request outstanding. The caller must check its own in-flight work
+    /// before concluding the crawl is over.
     Exhausted,
 }
 
@@ -113,6 +115,10 @@ struct HostQueue {
     /// Set once `robots.txt` says the whole host is off limits, so that its
     /// remaining queue can be dropped rather than fetched and discarded.
     blocked: bool,
+    /// A request to this host is outstanding. Without this, concurrent
+    /// crawling would hand the same host out several times at once and the
+    /// per-host delay would mean nothing.
+    in_flight: bool,
 }
 
 /// The queue of URLs waiting to be fetched.
@@ -190,9 +196,13 @@ impl Frontier {
                 fetched: 0,
                 delay: default_delay,
                 blocked: false,
+                in_flight: false,
             })
             .queue
-            .push_back(Candidate { url: normalized, depth });
+            .push_back(Candidate {
+                url: normalized,
+                depth,
+            });
         self.queued += 1;
         true
     }
@@ -204,12 +214,13 @@ impl Frontier {
         let mut earliest: Option<Instant> = None;
 
         for queue in self.hosts.values_mut() {
-            if queue.queue.is_empty() || queue.blocked {
+            if queue.queue.is_empty() || queue.blocked || queue.in_flight {
                 continue;
             }
             if queue.ready_at <= now {
                 if let Some(candidate) = queue.queue.pop_front() {
                     self.queued -= 1;
+                    queue.in_flight = true;
                     return Next::Ready(candidate);
                 }
             } else if earliest.is_none_or(|current| queue.ready_at < current) {
@@ -234,7 +245,24 @@ impl Frontier {
         if let Some(queue) = self.hosts.get_mut(host) {
             queue.fetched += 1;
             queue.ready_at = now + queue.delay;
+            queue.in_flight = false;
         }
+    }
+
+    /// Release a host we took a URL for but did not contact after all.
+    ///
+    /// Used when a cached `robots.txt` already tells us the URL is off limits:
+    /// no request was made, so no cooldown is owed and the host should become
+    /// eligible again immediately.
+    pub fn note_skipped(&mut self, host: &str) {
+        if let Some(queue) = self.hosts.get_mut(host) {
+            queue.in_flight = false;
+        }
+    }
+
+    /// Is a request to this host outstanding?
+    pub fn is_in_flight(&self, host: &str) -> bool {
+        self.hosts.get(host).is_some_and(|queue| queue.in_flight)
     }
 
     /// Apply a host's declared `Crawl-delay`.
@@ -301,7 +329,13 @@ mod tests {
     fn a_seed_is_immediately_ready() {
         let (mut f, now) = frontier();
         assert!(f.push(&url("https://a.test/"), 0, now));
-        assert_eq!(f.next(now), Next::Ready(super::Candidate { url: url("https://a.test/"), depth: 0 }));
+        assert_eq!(
+            f.next(now),
+            Next::Ready(super::Candidate {
+                url: url("https://a.test/"),
+                depth: 0
+            })
+        );
     }
 
     #[test]
@@ -343,7 +377,10 @@ mod tests {
             other => panic!("expected a wait, got {other:?}"),
         }
         // After the delay it becomes available.
-        assert!(matches!(f.next(now + super::DEFAULT_HOST_DELAY), Next::Ready(_)));
+        assert!(matches!(
+            f.next(now + super::DEFAULT_HOST_DELAY),
+            Next::Ready(_)
+        ));
     }
 
     #[test]
@@ -356,7 +393,9 @@ mod tests {
         f.push(&url("https://a.test/two"), 0, now);
         f.push(&url("https://b.test/one"), 0, now);
 
-        let Next::Ready(first) = f.next(now) else { panic!("expected a ready URL") };
+        let Next::Ready(first) = f.next(now) else {
+            panic!("expected a ready URL")
+        };
         let busy = first.url.host_str().unwrap().to_owned();
         f.note_fetched(&busy, now);
 
@@ -379,8 +418,14 @@ mod tests {
         f.note_fetched("a.test", now);
 
         // Our default would have released it by now; the site asked for longer.
-        assert!(matches!(f.next(now + super::DEFAULT_HOST_DELAY), Next::Wait(_)));
-        assert!(matches!(f.next(now + Duration::from_secs(30)), Next::Ready(_)));
+        assert!(matches!(
+            f.next(now + super::DEFAULT_HOST_DELAY),
+            Next::Wait(_)
+        ));
+        assert!(matches!(
+            f.next(now + Duration::from_secs(30)),
+            Next::Ready(_)
+        ));
     }
 
     #[test]
@@ -392,7 +437,10 @@ mod tests {
 
         f.next(now);
         f.note_fetched("a.test", now);
-        assert!(matches!(f.next(now + Duration::from_millis(10)), Next::Wait(_)));
+        assert!(matches!(
+            f.next(now + Duration::from_millis(10)),
+            Next::Wait(_)
+        ));
     }
 
     #[test]
@@ -426,7 +474,10 @@ mod tests {
 
     #[test]
     fn a_host_quota_stops_admitting_more() {
-        let limits = Limits { max_pages_per_host: 2, ..Limits::default() };
+        let limits = Limits {
+            max_pages_per_host: 2,
+            ..Limits::default()
+        };
         let mut f = Frontier::new(limits);
         let now = Instant::now();
 
@@ -462,6 +513,50 @@ mod tests {
             other => panic!("expected b.test, got {other:?}"),
         }
         assert_eq!(f.next(now), Next::Exhausted);
+    }
+
+    #[test]
+    fn a_host_is_not_handed_out_twice_at_once() {
+        // Without this, concurrent crawling would issue several simultaneous
+        // requests to one host and the delay would mean nothing.
+        let (mut f, now) = frontier();
+        f.push(&url("https://a.test/one"), 0, now);
+        f.push(&url("https://a.test/two"), 0, now);
+
+        assert!(matches!(f.next(now), Next::Ready(_)));
+        assert!(f.is_in_flight("a.test"));
+        // Second URL is queued and the host is off cooldown, but busy.
+        assert_eq!(f.next(now), Next::Exhausted);
+        assert_eq!(f.queued(), 1);
+    }
+
+    #[test]
+    fn a_skipped_host_becomes_eligible_immediately() {
+        let (mut f, now) = frontier();
+        f.push(&url("https://a.test/one"), 0, now);
+        f.push(&url("https://a.test/two"), 0, now);
+
+        f.next(now);
+        // We never contacted the host, so no cooldown is owed.
+        f.note_skipped("a.test");
+        assert!(!f.is_in_flight("a.test"));
+        assert!(matches!(f.next(now), Next::Ready(_)));
+    }
+
+    #[test]
+    fn other_hosts_stay_available_while_one_is_in_flight() {
+        let (mut f, now) = frontier();
+        f.push(&url("https://a.test/one"), 0, now);
+        f.push(&url("https://b.test/one"), 0, now);
+
+        let Next::Ready(first) = f.next(now) else {
+            panic!("expected a ready URL")
+        };
+        let busy = first.url.host_str().unwrap().to_owned();
+        match f.next(now) {
+            Next::Ready(second) => assert_ne!(second.url.host_str().unwrap(), busy),
+            other => panic!("expected the other host, got {other:?}"),
+        }
     }
 
     #[test]

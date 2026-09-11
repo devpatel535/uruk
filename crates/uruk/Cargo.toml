@@ -13,9 +13,18 @@ authors.workspace = true
 name = "uruk"
 path = "src/main.rs"
 
-# No dependencies yet, and that is deliberate. Every crate added from here on
-# should be justified in the commit that adds it.
+# Justifications:
+#   uruk-crawl - the crawler this binary drives
+#   clap       - argument parsing. Hand-rolling it was the alternative; clap
+#                earns its place because the CLI grows a subcommand per phase
+#                and its generated --help is the operator's documentation.
+#   tokio      - the crawler is async, so the binary owns the runtime
+#   url        - seed parsing, so a bad seed is reported before the crawl starts
 [dependencies]
+uruk-crawl = { path = "../uruk-crawl" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"
 
 [lints]
 workspace = true

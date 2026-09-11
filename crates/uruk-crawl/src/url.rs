@@ -158,7 +158,10 @@ pub fn resolve(base: &Url, href: &str) -> Result<Url, Rejected> {
 pub fn dedupe_key(url: &Url) -> String {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = url.path();
-    let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
+    let path = path
+        .strip_suffix('/')
+        .filter(|p| !p.is_empty())
+        .unwrap_or(path);
 
     let mut pairs: Vec<(String, String)> = url
         .query_pairs()
@@ -249,14 +252,23 @@ mod tests {
     #[test]
     fn rejects_absurdly_long_urls() {
         let long = format!("https://a.test/{}", "x".repeat(4000));
-        assert_eq!(normalize(&Url::parse(&long).unwrap()), Err(Rejected::TooLong));
+        assert_eq!(
+            normalize(&Url::parse(&long).unwrap()),
+            Err(Rejected::TooLong)
+        );
     }
 
     #[test]
     fn resolves_relative_links() {
         let base = Url::parse("https://a.test/dir/page.html").unwrap();
-        assert_eq!(resolve(&base, "../other.html").unwrap().as_str(), "https://a.test/other.html");
-        assert_eq!(resolve(&base, "/abs").unwrap().as_str(), "https://a.test/abs");
+        assert_eq!(
+            resolve(&base, "../other.html").unwrap().as_str(),
+            "https://a.test/other.html"
+        );
+        assert_eq!(
+            resolve(&base, "/abs").unwrap().as_str(),
+            "https://a.test/abs"
+        );
     }
 
     #[test]
@@ -295,6 +307,9 @@ mod tests {
 
     #[test]
     fn host_is_lowercased() {
-        assert_eq!(host_of(&Url::parse("https://EXAMPLE.test/p").unwrap()).unwrap(), "example.test");
+        assert_eq!(
+            host_of(&Url::parse("https://EXAMPLE.test/p").unwrap()).unwrap(),
+            "example.test"
+        );
     }
 }

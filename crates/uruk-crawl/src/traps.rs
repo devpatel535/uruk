@@ -68,11 +68,11 @@ pub enum Trap {
 /// Deliberately short. The `Content-Type` check after fetching is the real
 /// filter; this only avoids obviously pointless requests.
 const SKIP_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "ico", "bmp", "tiff", "mp3", "mp4",
-    "m4a", "m4v", "avi", "mov", "wmv", "flv", "webm", "ogg", "wav", "zip", "gz", "bz2", "xz",
-    "7z", "rar", "tar", "exe", "dmg", "iso", "msi", "deb", "rpm", "apk", "woff", "woff2",
-    "ttf", "otf", "eot", "css", "js", "mjs", "json", "xml", "rss", "atom", "doc", "docx",
-    "xls", "xlsx", "ppt", "pptx", "psd", "ai", "eps", "dwg", "bin", "dat", "swf",
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "ico", "bmp", "tiff", "mp3", "mp4", "m4a",
+    "m4v", "avi", "mov", "wmv", "flv", "webm", "ogg", "wav", "zip", "gz", "bz2", "xz", "7z", "rar",
+    "tar", "exe", "dmg", "iso", "msi", "deb", "rpm", "apk", "woff", "woff2", "ttf", "otf", "eot",
+    "css", "js", "mjs", "json", "xml", "rss", "atom", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "psd", "ai", "eps", "dwg", "bin", "dat", "swf",
 ];
 
 /// Years outside this range in a path segment suggest a generated calendar
@@ -93,8 +93,11 @@ pub fn check(url: &Url, depth: u32, host_count: usize, limits: &Limits) -> Resul
         return Err(Trap::HostQuotaReached);
     }
 
-    let segments: Vec<&str> =
-        url.path().split('/').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = url
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
 
     if segments.len() > limits.max_path_segments {
         return Err(Trap::PathTooDeep);
@@ -127,7 +130,10 @@ fn has_repeating_segments(segments: &[&str], allowed: usize) -> bool {
         if segment.len() < 2 {
             continue;
         }
-        let count = segments[index..].iter().filter(|other| *other == segment).count();
+        let count = segments[index..]
+            .iter()
+            .filter(|other| *other == segment)
+            .count();
         if count > allowed {
             return true;
         }
@@ -140,9 +146,9 @@ fn has_implausible_year(segments: &[&str]) -> bool {
     segments.iter().any(|segment| {
         segment.len() == 4
             && segment.bytes().all(|b| b.is_ascii_digit())
-            && segment
-                .parse::<u32>()
-                .is_ok_and(|year| !(EARLIEST_PLAUSIBLE_YEAR..=LATEST_PLAUSIBLE_YEAR).contains(&year))
+            && segment.parse::<u32>().is_ok_and(|year| {
+                !(EARLIEST_PLAUSIBLE_YEAR..=LATEST_PLAUSIBLE_YEAR).contains(&year)
+            })
     })
 }
 
@@ -156,11 +162,19 @@ mod tests {
     }
 
     fn allow(raw: &str) {
-        assert_eq!(check(&url(raw), 0, 0, &Limits::default()), Ok(()), "should have allowed {raw}");
+        assert_eq!(
+            check(&url(raw), 0, 0, &Limits::default()),
+            Ok(()),
+            "should have allowed {raw}"
+        );
     }
 
     fn deny(raw: &str, expected: Trap) {
-        assert_eq!(check(&url(raw), 0, 0, &Limits::default()), Err(expected), "for {raw}");
+        assert_eq!(
+            check(&url(raw), 0, 0, &Limits::default()),
+            Err(expected),
+            "for {raw}"
+        );
     }
 
     #[test]
@@ -174,7 +188,10 @@ mod tests {
     #[test]
     fn depth_is_bounded() {
         let limits = Limits::default();
-        assert_eq!(check(&url("https://a.test/p"), limits.max_depth, 0, &limits), Ok(()));
+        assert_eq!(
+            check(&url("https://a.test/p"), limits.max_depth, 0, &limits),
+            Ok(())
+        );
         assert_eq!(
             check(&url("https://a.test/p"), limits.max_depth + 1, 0, &limits),
             Err(Trap::TooDeep)
@@ -185,14 +202,22 @@ mod tests {
     fn a_host_quota_stops_one_site_dominating() {
         let limits = Limits::default();
         assert_eq!(
-            check(&url("https://a.test/p"), 0, limits.max_pages_per_host, &limits),
+            check(
+                &url("https://a.test/p"),
+                0,
+                limits.max_pages_per_host,
+                &limits
+            ),
             Err(Trap::HostQuotaReached)
         );
     }
 
     #[test]
     fn very_deep_paths_are_refused() {
-        deny("https://a.test/a/b/c/d/e/f/g/h/i/j/k/l/m/n", Trap::PathTooDeep);
+        deny(
+            "https://a.test/a/b/c/d/e/f/g/h/i/j/k/l/m/n",
+            Trap::PathTooDeep,
+        );
     }
 
     #[test]
