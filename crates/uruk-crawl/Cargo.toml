@@ -16,6 +16,8 @@ authors.workspace = true
 #   url      - URL parsing and relative resolution per WHATWG. Normalisation on
 #              top of it is ours, in url.rs, because the rules are policy.
 #   scraper  - html5ever-backed DOM. Real-world HTML is too broken for regex.
+#   ego_tree - scraper's tree type. Named directly because boilerplate removal
+#              needs a manual walk that skips subtrees, which .text() cannot do.
 #   zstd     - crawl store compression (RESEARCH.md section 7)
 #   serde    - crawl record serialisation
 #   thiserror- typed errors; a crawler needs to distinguish failure kinds to
@@ -29,6 +31,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
 url = "2"
 scraper = "0.23"
+ego-tree = "0.10"
 zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

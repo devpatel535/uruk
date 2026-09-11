@@ -4,6 +4,9 @@
 //! and queues those to visit next — politely enough that no site operator has
 //! cause to complain.
 
+pub mod frontier;
+pub mod parse;
 pub mod robots;
 pub mod simhash;
+pub mod traps;
 pub mod url;
