@@ -598,9 +598,12 @@ six. Worth a decision; I'd take it.
 
 ## 6. What "small on disk" actually means, in numbers
 
-> **Updated after building it.** This section originally contained an
-> estimate. The indexer now exists, so the estimate has been replaced with a
-> measurement — and the estimate was wrong, in the direction that matters.
+> **Updated twice after building it.** This section originally contained an
+> estimate. Then the indexer existed and the estimate was replaced with a
+> measurement, which came in a third worse. Then Phase 5 rewrote the format and
+> the measurement moved again — back to roughly where the estimate had been.
+> All three numbers are kept below, in order, because the sequence is the
+> interesting part.
 
 ### What was estimated
 
@@ -609,12 +612,20 @@ I projected postings at 1.0–1.5 bytes each, positions at ~1–1.5 bytes each, 
 a total of **~3.5 GB per million pages**, with the index at **25–37%** of the
 extracted text once positions were included.
 
+Reading this back after Phase 5: the estimate was a reasonable account of what
+the data costs when it is packed well. What it did not model was the format —
+and the first format I wrote spent 40% of the index on bookkeeping the estimate
+never imagined anyone would pay for. The estimate was not wrong about the
+information. It was wrong to assume the implementation would be tight, which is
+a different mistake and a more useful one to notice.
+
 ### What was measured
 
 `cargo run --release --example index_size -p uruk-index -- 20000` builds a
 synthetic corpus with the statistics real prose has — a Zipf-distributed
 vocabulary, which is what decides how well delta encoding does — and indexes
-it. On 20,000 documents averaging 5.8 KB of text:
+it. On 20,000 documents averaging 5.8 KB of text, the **first** version of the
+index came to:
 
 | Component | Size | % of extracted text |
 |---|---|---|
@@ -626,19 +637,18 @@ it. On 20,000 documents averaging 5.8 KB of text:
 |   host + document tables | 0.25 MB | 0.2% |
 
 **5.72 bytes per posting**, and **5.2 KB per page** for store and index
-together — which extrapolates to roughly **4.8 GB per million pages**, about
-a third worse than estimated.
+together — which extrapolated to roughly **4.8 GB per million pages**, about a
+third worse than estimated. At 100,000 documents the figures were unchanged:
+5.72 bytes per posting, 48.7% of text, 5,144 bytes per page.
 
-Re-run at 100,000 documents the figures are unchanged: 5.72 bytes per posting,
-48.7% of text, 5,144 bytes per page. The extrapolation is a stable ratio rather
-than one data point — the term dictionary halves as a share of the index (0.4%
-to 0.2%) as it amortises, and everything else holds.
+That is the number Phase 5 set out to beat. The rest of this section is what
+beating it took, which was not what I expected.
 
 ### Why the estimate was wrong
 
 Two things I did not cost:
 
-- **Per-posting overhead.** Every posting carries a field bitmask and at least
+- **Per-posting overhead.** Every posting carried a field bitmask and at least
   one count, which is two bytes before any document id or position is written.
   At roughly 515 postings per document that is over a kilobyte per page spent
   on bookkeeping.
@@ -646,13 +656,13 @@ Two things I did not cost:
   variable-byte encoding needs a second byte above 127. I had assumed roughly
   one byte each.
 
-One byte of the original figure has already been recovered: the encoder used
-to store the number of positions in each posting, which is exactly the sum of
-the field counts sitting next to it. Removing it took the index from 57.3% to
-48.9% of the text, which is a good illustration of how much a byte per posting
-is worth at this scale.
+One byte came back before Phase 5 even started: the encoder used to store the
+number of positions in each posting, which is exactly the sum of the field
+counts sitting next to it. Removing it took the index from 57.3% to 48.9% of
+the text — a good early illustration of how much a single byte per posting is
+worth at this scale, and a hint about where the rest of the fat was.
 
-### Phase 5 measured: the codecs, and a surprise
+### Phase 5, part one: the codecs, and a surprise
 
 `cargo run --release --example codec_bench -p uruk-index` implements
 variable-byte, Simple-9, frame-of-reference bit-packing and `PForDelta`, and
@@ -669,8 +679,8 @@ conclusion, so here it is.
 | bit-packed (FOR) | 9.62 | 268 | **85%** |
 | `PForDelta` | 9.37 | 253 | **83%** |
 
-**Position gaps within documents** (short lists, which is what the index
-actually stores per posting):
+**Position gaps within documents**, measured the way the index stored them at
+the time — one short list per posting:
 
 | codec | bits/value | decode Mvals/s | size vs varint |
 |---|---|---|---|
@@ -695,67 +705,107 @@ of the block regardless.
 
 **Simple-9 is actively harmful on short lists.** A list of one value costs a
 whole 32-bit word. Most terms appear once in most documents, so most position
-lists are one or two values long, and Simple-9 doubles them.
+lists were one or two values long, and Simple-9 doubled them.
 
-**The largest finding is that the codec is not the lever.** Block schemes give
-essentially nothing on positions — not because they encode badly, but because
-the lists are too short for a block ever to fill, so everything falls through
-to the variable-byte tail. And the gains they do give apply only to the gap
-bytes, which are roughly half of the 5.72 bytes a posting costs. Switching
-every codec to the best available would take the index from 49% of text to
-around 44%.
+**The largest finding was that the codec is not the lever.** Block schemes
+gave essentially nothing on positions — not because they encode badly, but
+because the lists were too short for a block ever to fill, so everything fell
+through to the variable-byte tail. Switching every codec to the best available
+would have taken the index from 49% of text to around 44%. Worth having, and
+nowhere near enough.
 
-What would actually move it are two structural changes, neither of which is a
-codec:
+So the benchmark's real output was not a codec ranking. It was a diagnosis:
+**the format was wrong, and no codec could fix it from inside.**
 
-1. **Store each term's positions as one stream across all its documents**,
-   the way Lucene's separate positions file does, rather than as a short list
-   per posting. Then the blocks fill, and the 15% that block encoding cannot
-   currently reach on positions becomes available.
-2. **Get the fixed per-posting bytes down.** The field mask and count are two
-   bytes on every posting before any gap is written, and at ~515 postings per
-   document that is over a kilobyte a page spent on bookkeeping.
+### Phase 5, part two: the restructuring, which is where the index got small
 
-So Phase 5's answer is: adopt `PForDelta` for document ids, keep
-variable-byte for anything short, and do not expect the codec choice alone to
-change the headline number. The restructuring is where the index gets small.
+The old layout was one self-describing record per document, interleaved:
 
-### What this means for Phase 5
+```text
+docgap, field mask, count per field, position gap, position gap, ...
+docgap, field mask, count per field, position gap, ...
+```
 
-The measurement points straight at the work. Variable-byte is a per-value
-encoding, and almost half the index is now per-posting fixed cost that a
-per-value encoding cannot amortise. The single biggest lever is **block-based
-encoding** in the Lucene style: cut postings into fixed blocks of 128
-documents, bit-pack each block at the width its largest value actually needs,
-and hoist the field mask out of the per-posting path. Positions of ~800 need
-ten bits, not sixteen.
+Two faults, both now obvious in hindsight:
 
-That is precisely the Phase 5 work the brief asks for, and the harness to
-measure it now exists: `examples/index_size.rs` prints the postings line, and
-`examples/codec_bench.rs` compares the codecs directly. **5.72 bytes per
-posting is the number to improve on** — and the section below reports what the
-codecs actually did about it, which is less than the textbooks imply.
+1. **Nothing similar sat next to anything similar.** A block codec wants a run
+   of values drawn from the same distribution. This layout gave it a document
+   gap, then a mask, then a count, then two positions — runs of one. Blocks
+   never filled, so every value fell through to the variable-byte tail.
+2. **Every posting paid fixed bytes for facts that were already known.** The
+   mask and the body's count were written on all 515 postings per page, when
+   the overwhelming majority of postings touch the body and nothing else.
+
+The index now writes four streams per term instead:
+
+```text
+varint  document count
+stream  document-id gaps          (PForDelta blocks, varint tail)
+stream  (frequency << 1) | flag   (PForDelta blocks, varint tail)
+bytes   field detail, only for the postings whose flag is set
+stream  position gaps             (PForDelta blocks, varint tail)
+```
+
+Positions are concatenated across every document in the list, resetting the
+delta at each document boundary so the gaps stay small — this is what Lucene's
+separate positions file is for, and it is what finally lets the blocks fill.
+The field mask is written only for the minority of postings touching something
+other than the body, and two numbers are dropped entirely because they are
+recoverable: the count of positions (it is the frequency) and the body's own
+count (it is the frequency minus the other fields').
+
+**Measured, on the same corpora:**
+
+| | before | after | change |
+|---|---|---|---|
+| bytes per posting, 20k docs | 5.72 | **3.55** | −38% |
+| bytes per posting, 100k docs | 5.72 | **3.41** | −40% |
+| index as % of text, 100k docs | 48.7% | **29.2%** | −40% |
+| store + index per page, 100k docs | 5,144 B | **3,951 B** | −23% |
+| extrapolated to 1M pages | 4.8 GB | **3.7 GB** | −23% |
+
+I predicted about 3.7 bytes per posting before making the change. It came in
+at 3.41, so the prediction was right in direction and slightly pessimistic in
+size — the first honest prediction in this section, after the estimate at the
+top of it was wrong by a third.
+
+**What this means in general**, and it is the most transferable thing in this
+document: *the data layout dominated the entropy coder by roughly an order of
+magnitude.* The best codec swap available was worth 5 percentage points of
+index size. Rearranging the same values into streams the codec could actually
+work on was worth 20. The literature spends most of its pages on the coders;
+the wins were in the layout.
+
+The codec work was not wasted — `PForDelta` is what every stream now uses, and
+the benchmark is what identified the layout as the problem. But the honest
+summary of Phase 5 is: *benchmark the codecs to find out that the codecs are
+not the problem.*
 
 ### Scaling, and the brief's target
 
 Against the brief's hope of 15–25% of raw text, the honest position is:
 
-- a **positionless** index would land near the target, but would give up
-  phrase search and proximity, which the brief explicitly wants;
-- the index we actually want is at **49%** today, and block encoding should
-  bring it substantially down — but 15–25% with positions is not a target I
-  would promise before it is measured.
+- a **positionless** index would beat the target, but would give up phrase
+  search and proximity, which the brief explicitly wants;
+- the index we actually want is at **29% of text with positions**, down from
+  49%, and I do not see another 40% available without giving something up.
+  Getting under 25% would mean dropping positions for rare terms, or dropping
+  the position stream for the body of very long documents — both of which
+  trade a correctness property for bytes, and neither of which I would take
+  without a judged query set to measure the damage.
 
-I'd restate the goal as a number that can be checked on every build: **under
-4 KB on disk per indexed page, everything included.** Today it is 5.2 KB.
+I restated the goal as a number that can be checked on every build: **under
+4 KB on disk per indexed page, everything included.** It was 5.2 KB. It is now
+**3,951 bytes**, so that target is met, with the crawl store — not the index —
+now the larger half.
 
 | Corpus | Store + index today | Fits where |
 |---|---|---|
-| 100,000 pages | ~0.5 GB | Anywhere. Ships as a download. |
-| 1 million pages | ~4.8 GB | A laptop. Offline personal search is practical. |
-| 10 million pages | ~48 GB | A desktop or a cheap VPS with a decent disk. |
-| 100 million pages | ~480 GB | A dedicated machine. Shippable to users: no. |
-| 1 billion pages | ~4.8 TB | A small rack, and a different project. |
+| 100,000 pages | ~0.4 GB | Anywhere. Ships as a download. |
+| 1 million pages | ~3.7 GB | A laptop. Offline personal search is practical. |
+| 10 million pages | ~37 GB | A desktop or a cheap VPS with a decent disk. |
+| 100 million pages | ~370 GB | A dedicated machine. Shippable to users: no. |
+| 1 billion pages | ~3.7 TB | A small rack, and a different project. |
 
 That still answers your fourth Section 15 question the same way: **a shippable
 offline index is realistic up to about 1–10 million pages and stops being
@@ -769,10 +819,10 @@ pages/second. One million pages is about 3–6 hours of wall-clock fetching; ten
 million is a couple of days. Bandwidth, not politeness, is the limit, and 1M
 pages is roughly 50 GB downloaded. This is all very tractable.
 
-**Indexing time**, measured: 20,000 documents in 27 seconds and 100,000 in 129
-seconds, single-threaded — so it scales linearly at about 775 pages a second,
-and a million pages is a little over twenty minutes. Indexing is not the
-bottleneck and does not need to be parallel yet.
+**Indexing time**, measured: 20,000 documents in 20 seconds and 100,000 in 96
+seconds, single-threaded — so it scales linearly at about 1,040 pages a second,
+and a million pages is about sixteen minutes. Indexing is not the bottleneck
+and does not need to be parallel yet.
 
 ---
 

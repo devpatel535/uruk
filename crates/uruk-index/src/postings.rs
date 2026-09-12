@@ -20,6 +20,7 @@
 //! written out by hand rather than handed to a compression crate. Measuring
 //! alternatives needs a baseline we control and can decode instrumentally.
 
+use crate::codec::{Codec, PForDelta};
 use crate::fields::{FIELD_COUNT, FieldCounts};
 
 /// Append `value` in variable-byte form.
@@ -104,11 +105,32 @@ impl Posting {
 
 /// Encode a term's postings.
 ///
+/// # Layout
+///
+/// Four streams rather than one interleaved record per document. Measurement
+/// (`RESEARCH.md` §6) showed why: block codecs need long runs of similar
+/// values to pay off, and interleaving a document gap, a frequency and two
+/// positions gives them runs of one.
+///
+/// ```text
+/// varint  document count
+/// stream  document-id gaps          (PForDelta blocks, varint tail)
+/// stream  (frequency << 1) | flag   (PForDelta blocks, varint tail)
+/// bytes   field detail, only for the postings whose flag is set
+/// stream  position gaps             (PForDelta blocks, varint tail)
+/// ```
+///
+/// Two things are deliberately *not* stored, because they can be recovered:
+///
+/// - the number of positions, which is the total frequency;
+/// - the body field's count, which is the total minus the other fields'.
+///
+/// And the field mask is written only for the minority of postings that touch
+/// a field other than the body. Together these remove the fixed per-posting
+/// bytes that the measurement identified as the largest single cost.
+///
 /// The list must be sorted by document id; delta encoding depends on it, and
 /// so does the skipping a query does at read time.
-///
-/// The number of positions is **not** written: it equals the sum of the field
-/// counts, which is already there. See the invariant on [`Posting`].
 ///
 /// # Panics
 ///
@@ -129,30 +151,70 @@ pub fn encode(postings: &[Posting], out: &mut Vec<u8>) {
     );
 
     write_varint(out, postings.len() as u64);
-    let mut previous_doc = 0u32;
+    if postings.is_empty() {
+        return;
+    }
 
+    // --- document-id gaps ---
+    let mut gaps = Vec::with_capacity(postings.len());
+    let mut previous = 0u32;
     for posting in postings {
-        write_varint(out, u64::from(posting.doc - previous_doc));
-        previous_doc = posting.doc;
+        gaps.push(posting.doc - previous);
+        previous = posting.doc;
+    }
+    STREAM.encode(&gaps, out);
 
-        // A bitmask of which fields are non-zero, so a term that appears only
-        // in the body costs one mask byte and one count rather than four
-        // counts, three of which are zero.
-        let mask = posting.counts.mask();
+    // --- frequencies, with a flag bit for "has a field other than the body" ---
+    let mut frequencies = Vec::with_capacity(postings.len());
+    for posting in postings {
+        let flag = u32::from(other_fields_mask(posting.counts) != 0);
+        frequencies.push((posting.counts.total() << 1) | flag);
+    }
+    STREAM.encode(&frequencies, out);
+
+    // --- field detail for the minority that need it ---
+    for posting in postings {
+        let mask = other_fields_mask(posting.counts);
+        if mask == 0 {
+            continue;
+        }
         out.push(mask);
-        for field in 0..FIELD_COUNT {
+        for field in 1..FIELD_COUNT {
             if mask & (1 << field) != 0 {
                 write_varint(out, u64::from(posting.counts.get_index(field)));
             }
         }
+    }
 
-        // Deliberately no position count: it is `counts.total()`.
-        let mut previous_position = 0u32;
+    // --- positions, one stream across every document ---
+    let total: usize = postings.iter().map(|posting| posting.positions.len()).sum();
+    let mut deltas = Vec::with_capacity(total);
+    for posting in postings {
+        // Reset at each document boundary, so gaps stay small rather than
+        // carrying a document's whole length across the join.
+        let mut previous = 0u32;
         for &position in &posting.positions {
-            write_varint(out, u64::from(position - previous_position));
-            previous_position = position;
+            deltas.push(position - previous);
+            previous = position;
         }
     }
+    STREAM.encode(&deltas, out);
+}
+
+/// The codec every stream uses.
+///
+/// `PForDelta` measured best on document-id gaps and no worse than
+/// variable-byte anywhere, and it falls back to variable-byte for any tail
+/// shorter than a block — which is most terms.
+const STREAM: PForDelta = PForDelta;
+
+/// Which fields other than the body this posting touches.
+///
+/// The body is excluded because its count is recoverable: it is the total
+/// frequency minus everything else.
+fn other_fields_mask(counts: FieldCounts) -> u8 {
+    // `Field::Body` is index 0 by construction, pinned by a test in `fields`.
+    counts.mask() & !1
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,68 +233,106 @@ pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeEr
 
     let count = read_varint(input, cursor).ok_or_else(|| fail(*cursor, "truncated length"))?;
     let count = usize::try_from(count).map_err(|_| fail(*cursor, "implausible length"))?;
-    // A corrupt length must not make us allocate gigabytes; the list cannot be
-    // longer than one posting per remaining byte.
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    // A corrupt length must not make us allocate gigabytes.
     if count > input.len().saturating_sub(*cursor) + 1 {
         return Err(fail(*cursor, "length exceeds the remaining bytes"));
     }
 
+    let gaps = STREAM
+        .decode(input, cursor, count)
+        .ok_or_else(|| fail(*cursor, "truncated document gaps"))?;
+    let frequencies = STREAM
+        .decode(input, cursor, count)
+        .ok_or_else(|| fail(*cursor, "truncated frequencies"))?;
+
     let mut postings = Vec::with_capacity(count);
+    let mut wanted = Vec::with_capacity(count);
     let mut doc = 0u32;
+    let mut positions_expected = 0usize;
 
-    for _ in 0..count {
-        let delta = read_varint(input, cursor).ok_or_else(|| fail(*cursor, "truncated doc gap"))?;
-        let delta = u32::try_from(delta).map_err(|_| fail(*cursor, "doc gap out of range"))?;
+    // Nothing here may allocate in proportion to a decoded value: `total` comes
+    // off the disk and a corrupt segment can claim four billion positions for a
+    // single document. The position vectors are sized after the bound check
+    // below, once the claim has been weighed against the bytes that remain.
+    for (&gap, &packed) in gaps.iter().zip(&frequencies) {
         doc = doc
-            .checked_add(delta)
-            .ok_or_else(|| fail(*cursor, "doc id overflow"))?;
-
-        let mask = *input
-            .get(*cursor)
-            .ok_or_else(|| fail(*cursor, "truncated field mask"))?;
-        *cursor += 1;
+            .checked_add(gap)
+            .ok_or_else(|| fail(*cursor, "document id overflow"))?;
+        let total = packed >> 1;
+        let has_other_fields = packed & 1 == 1;
 
         let mut counts = FieldCounts::default();
-        for field in 0..FIELD_COUNT {
-            if mask & (1 << field) != 0 {
-                let value =
-                    read_varint(input, cursor).ok_or_else(|| fail(*cursor, "truncated count"))?;
-                let value =
-                    u32::try_from(value).map_err(|_| fail(*cursor, "count out of range"))?;
-                counts.set_index(field, value);
+        if has_other_fields {
+            let mask = *input
+                .get(*cursor)
+                .ok_or_else(|| fail(*cursor, "truncated field mask"))?;
+            *cursor += 1;
+            let mut others = 0u32;
+            for field in 1..FIELD_COUNT {
+                if mask & (1 << field) != 0 {
+                    let value = read_varint(input, cursor)
+                        .ok_or_else(|| fail(*cursor, "truncated field count"))?;
+                    let value =
+                        u32::try_from(value).map_err(|_| fail(*cursor, "count out of range"))?;
+                    counts.set_index(field, value);
+                    others = others
+                        .checked_add(value)
+                        .ok_or_else(|| fail(*cursor, "field counts overflow"))?;
+                }
             }
+            // The body's count is whatever the other fields did not account for.
+            let body = total
+                .checked_sub(others)
+                .ok_or_else(|| fail(*cursor, "field counts exceed the total frequency"))?;
+            counts.set_index(0, body);
+        } else {
+            counts.set_index(0, total);
         }
 
-        // Recovered from the counts rather than stored; see `Posting`.
-        let positions_len = counts.total() as usize;
-        if positions_len > input.len().saturating_sub(*cursor) + 1 {
-            return Err(fail(*cursor, "positions exceed the remaining bytes"));
-        }
-
-        let mut positions = Vec::with_capacity(positions_len);
-        let mut position = 0u32;
-        for _ in 0..positions_len {
-            let gap = read_varint(input, cursor)
-                .ok_or_else(|| fail(*cursor, "truncated position gap"))?;
-            let gap = u32::try_from(gap).map_err(|_| fail(*cursor, "position gap out of range"))?;
-            position = position
-                .checked_add(gap)
-                .ok_or_else(|| fail(*cursor, "position overflow"))?;
-            positions.push(position);
-        }
-
+        let count = usize::try_from(total).map_err(|_| fail(*cursor, "frequency too large"))?;
+        positions_expected = positions_expected.saturating_add(count);
+        wanted.push(count);
         postings.push(Posting {
             doc,
             counts,
-            positions,
+            positions: Vec::new(),
         });
+    }
+
+    // A position cannot cost less than a bit, so a list claiming more positions
+    // than the remaining bytes could hold is corrupt. The slack of one byte
+    // covers a stream that is entirely block headers.
+    if positions_expected > input.len().saturating_sub(*cursor).saturating_mul(8) + 8 {
+        return Err(fail(*cursor, "positions exceed the remaining bytes"));
+    }
+    let deltas = STREAM
+        .decode(input, cursor, positions_expected)
+        .ok_or_else(|| fail(*cursor, "truncated positions"))?;
+
+    let mut at = 0usize;
+    for (posting, &count) in postings.iter_mut().zip(&wanted) {
+        let slice = deltas
+            .get(at..at + count)
+            .ok_or_else(|| fail(*cursor, "short positions"))?;
+        posting.positions.reserve_exact(count);
+        let mut position = 0u32;
+        for &delta in slice {
+            position = position
+                .checked_add(delta)
+                .ok_or_else(|| fail(*cursor, "position overflow"))?;
+            posting.positions.push(position);
+        }
+        at += count;
     }
     Ok(postings)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Posting, decode, encode, read_varint, write_varint};
+    use super::{Codec, Posting, STREAM, decode, encode, read_varint, write_varint};
     use crate::fields::Field;
 
     fn round_trip_varint(value: u64) {
@@ -373,17 +473,19 @@ mod tests {
     }
 
     #[test]
-    fn the_position_count_is_not_stored_twice() {
-        // It equals the sum of the field counts, so writing it would be a
-        // wasted byte on every posting in the index.
+    fn a_body_only_posting_costs_nothing_it_does_not_have_to() {
+        // The floor for one posting: a document gap, a frequency, a position.
+        // Everything else is derived — the number of positions is the
+        // frequency, and the body's count is the frequency minus the other
+        // fields, of which there are none here. No mask byte, no count byte.
         let mut one = Posting::new(0);
         one.counts.set(Field::Body, 1);
         one.positions = vec![7];
 
         let mut buffer = Vec::new();
         encode(std::slice::from_ref(&one), &mut buffer);
-        // count(1) + docgap(1) + mask(1) + bodycount(1) + position(1) = 5.
-        assert_eq!(buffer.len(), 5, "unexpected encoding: {buffer:?}");
+        // count(1) + docgap(1) + frequency(1) + position(1) = 4.
+        assert_eq!(buffer.len(), 4, "unexpected encoding: {buffer:?}");
 
         let mut cursor = 0;
         assert_eq!(decode(&buffer, &mut cursor).unwrap(), vec![one]);
@@ -416,6 +518,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_wild_frequency_does_not_allocate() {
+        // The length prefix is not the only number from disk that sizes an
+        // allocation. A posting claiming four billion positions must be
+        // rejected against the bytes that are actually there, before any vector
+        // is sized from it.
+        let mut buffer = Vec::new();
+        write_varint(&mut buffer, 1); // one posting
+        STREAM.encode(&[0], &mut buffer); // document 0
+        // The low bit is the "has other fields" flag, so this is a frequency of
+        // just under two billion, with no field detail to follow.
+        STREAM.encode(&[u32::MAX - 1], &mut buffer);
+
+        let mut cursor = 0;
+        let error = decode(&buffer, &mut cursor).expect_err("an absurd frequency was believed");
+        assert_eq!(error.reason, "positions exceed the remaining bytes");
+    }
+
+    #[test]
+    fn a_long_list_costs_far_less_per_posting_than_a_short_one() {
+        // The point of the four-stream layout: with a term's positions gathered
+        // into one stream, the blocks fill and the per-posting cost collapses.
+        // A single posting cannot do better than a few bytes; a thousand of
+        // them should average well under two.
+        let postings: Vec<Posting> = (0..1_000u32)
+            .map(|doc| {
+                let mut posting = Posting::new(doc * 3);
+                posting.counts.set(Field::Body, 2);
+                posting.positions = vec![doc % 700, doc % 700 + 40];
+                posting
+            })
+            .collect();
+
+        let mut buffer = Vec::new();
+        encode(&postings, &mut buffer);
+        let per_posting = buffer.len() as f64 / postings.len() as f64;
+        assert!(
+            per_posting < 4.0,
+            "{per_posting:.2} bytes per posting: the streams are not filling blocks"
+        );
+
+        let mut cursor = 0;
+        assert_eq!(decode(&buffer, &mut cursor).unwrap(), postings);
     }
 
     #[test]

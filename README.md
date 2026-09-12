@@ -29,7 +29,7 @@ What is built, against the brief's order of work:
 | 2. Crawler: fetch, parse, store politely | done |
 | 3. Indexer: inverted index in `.uruk` segments | done |
 | 4. Query engine: BM25F, phrases, a CLI | done |
-| 5. Compression, benchmarked against alternatives | codecs written and measured; see [the numbers](RESEARCH.md#phase-5-measured-the-codecs-and-a-surprise). Not yet wired into the segment format |
+| 5. Compression, benchmarked against alternatives | done — index cut from 49% to 29% of the text it describes; [the numbers, and why the codec was not the lever](RESEARCH.md#6-what-small-on-disk-actually-means-in-numbers) |
 | 6. Link graph and authority scoring | not started |
 | 7. Web front end | done |
 | 8. Privacy hardening and self-host packaging | partly — headers and policy done, packaging not |
@@ -95,6 +95,10 @@ Claims worth being precise about, each of which has a test:
   --explain`), and a test asserts the parts sum exactly to the score.
 - Served pages load nothing from anywhere else, set no cookies, and send no
   referrer to the sites they link to.
+- A segment written by a different version of the format is refused by name,
+  not decoded into plausible-looking wrong answers. That failure happened once
+  during development and cost an afternoon, so the version is now checked on
+  open and bumped on every encoding change.
 
 ## Building
 
@@ -102,7 +106,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 325 tests
+cargo test --workspace          # 327 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -113,6 +117,12 @@ Measuring what the index costs, on a corpus large enough to mean something:
 cargo run --release --example index_size  -p uruk-index -- 100000
 cargo run --release --example codec_bench -p uruk-index
 ```
+
+At 100,000 documents the index is **29% of the text it describes**, at 3.41
+bytes per posting, and store and index together come to **3,951 bytes per
+indexed page** — about 3.7 GB per million pages, with phrase search and
+proximity intact. Both numbers print on every run, so a change that makes the
+index fatter is visible immediately.
 
 ## Licence
 

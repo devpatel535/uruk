@@ -177,9 +177,11 @@ fn main() {
     report("position gaps within documents", &positions);
 
     println!(
-        "\nRead the size column against `index_size`'s 5.72 bytes per posting:\n\
-         the postings section is roughly one document-id gap plus one position\n\
-         per posting, so a scheme that halves both halves the largest part of\n\
-         the index.\n"
+        "\nRead the size column against `index_size`'s bytes-per-posting line.\n\
+         The position workload above is the pessimistic one: it measures each\n\
+         document's positions as its own short list, which is what the segment\n\
+         used to store. It now concatenates a term's positions into a single\n\
+         stream, so the blocks fill and the real figure sits nearer the\n\
+         document-id column than this one.\n"
     );
 }

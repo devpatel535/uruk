@@ -78,7 +78,10 @@ const MAGIC: &[u8; 8] = b"URUKIDX1";
 /// - 1: first format.
 /// - 2: host table added; positions kept for every field rather than the body
 ///   alone; the redundant per-posting position count removed.
-const FORMAT_VERSION: u32 = 2;
+/// - 3: postings split into separate document-id, frequency and position
+///   streams so block codecs have runs long enough to pay off, with the field
+///   mask written only for postings that touch a field other than the body.
+const FORMAT_VERSION: u32 = 3;
 /// 4 section offsets + term count + 4 corpus totals + doc count + magic.
 const FOOTER_LEN: u64 = 8 * 5 + 8 * FIELD_COUNT as u64 + 4 + 8;
 
