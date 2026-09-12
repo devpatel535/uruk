@@ -16,6 +16,7 @@ from the command line or from a web page.
 ```sh
 uruk crawl  --seeds seeds.txt --out data/crawl --max-pages 1000
 uruk index  --crawl data/crawl --out data/index
+uruk link   --crawl data/crawl --seeds seeds.txt
 uruk search --index data/index --crawl data/crawl "clay tablets"
 uruk serve  --index data/index --crawl data/crawl
 ```
@@ -30,7 +31,7 @@ What is built, against the brief's order of work:
 | 3. Indexer: inverted index in `.uruk` segments | done |
 | 4. Query engine: BM25F, phrases, a CLI | done |
 | 5. Compression, benchmarked against alternatives | done — index cut from 49% to 29% of the text it describes; [the numbers, and why the codec was not the lever](RESEARCH.md#6-what-small-on-disk-actually-means-in-numbers) |
-| 6. Link graph and authority scoring | not started |
+| 6. Link graph and authority scoring | done — host graph, in-degree and TrustRank; [what it measured against a link farm](RESEARCH.md#53-pagerank-on-a-small-crawl-does-almost-nothing--and-theres-evidence) |
 | 7. Web front end | done |
 | 8. Privacy hardening and self-host packaging | partly — headers and policy done, packaging not |
 | 9. Scale the crawl, tune against a judged query set | blocked on choosing a subject area |
@@ -71,11 +72,14 @@ the wrong design.
 | CLI | `uruk` | One subcommand per component |
 | Crawler | `uruk-crawl` | Fetches politely, extracts text and links, stores compressed |
 | Indexer | `uruk-index` | Tokenises, builds `.uruk` segments, merges nothing yet |
+| Link graph | `uruk-link` | Collapses links to hosts, scores authority, refuses to count self-votes |
 | Query engine | `uruk-query` | Matches, ranks with BM25F, explains every result |
 | Front end | `uruk-serve` | Server-rendered HTML, under 2 KB a page |
 
 A crawl writes `pages.uruk` (block-compressed text) and `pages.idx`. An index
 writes one or more `segment-*.uruk` files plus a readable `index.json`.
+`uruk link` writes `authority.json` beside the crawl; `search` and `serve` pick
+it up automatically, and rank on text alone if it is not there.
 
 ### What each piece actually guarantees
 
@@ -93,6 +97,9 @@ Claims worth being precise about, each of which has a test:
   `site:host` all work, including phrases inside titles.
 - Every result can show its per-signal score breakdown (`uruk search
   --explain`), and a test asserts the parts sum exactly to the score.
+- A host linking to another host counts **once**, however many pages it uses,
+  and a site cannot vote for itself. A fixture where a sixteen-page link farm
+  is 84% of the corpus scores that farm zero.
 - Served pages load nothing from anywhere else, set no cookies, and send no
   referrer to the sites they link to.
 - A segment written by a different version of the format is refused by name,
@@ -106,7 +113,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 327 tests
+cargo test --workspace          # 348 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

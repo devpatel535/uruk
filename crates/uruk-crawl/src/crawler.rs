@@ -272,12 +272,29 @@ pub async fn run(config: CrawlConfig) -> Result<CrawlSummary, CrawlError> {
 
     let mut frontier = Frontier::new(config.limits).with_default_delay(config.host_delay);
     let start = Instant::now();
-    if !config
-        .seeds
-        .iter()
-        .any(|seed| frontier.push(seed, 0, start))
-    {
+
+    // Every seed, not just the first one that works. This was `.any(..)`, which
+    // short-circuits: the first seed the frontier accepted ended the loop and
+    // every seed after it was dropped without a word. A hand-picked list of
+    // five hundred sites crawled one of them and reported success. Nothing
+    // caught it because every test until now used a single seed.
+    let mut accepted = 0usize;
+    for seed in &config.seeds {
+        if frontier.push(seed, 0, start) {
+            accepted += 1;
+        }
+    }
+    if accepted == 0 {
         return Err(CrawlError::NoSeeds);
+    }
+    let rejected = config.seeds.len() - accepted;
+    if rejected > 0 && config.progress {
+        // Seeds are hand-picked, so one being unusable is worth a line rather
+        // than a silent drop.
+        eprintln!(
+            "uruk: {rejected} of {} seeds were not usable",
+            config.seeds.len()
+        );
     }
 
     let mut state = CrawlState {

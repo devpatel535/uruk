@@ -29,6 +29,7 @@ use axum::routing::get;
 
 use uruk_crawl::store::StoreReader;
 use uruk_index::index::Index;
+use uruk_link::Authority;
 use uruk_query::parse;
 use uruk_query::search::{SearchOptions, search};
 use uruk_query::snippet::{self, SnippetPolicy};
@@ -46,6 +47,9 @@ const MAX_QUERY_LEN: usize = 512;
 struct Engine {
     index: Index,
     store: StoreReader,
+    /// Host standing, loaded once at start-up. `None` when `uruk link` has not
+    /// been run against this crawl, in which case results rank on text alone.
+    authority: Option<Authority>,
 }
 
 /// Everything a handler needs.
@@ -86,6 +90,8 @@ pub enum ServeError {
     Index(#[from] uruk_index::build::IndexError),
     #[error("could not open the crawl store: {0}")]
     Store(#[from] uruk_crawl::store::StoreError),
+    #[error("could not read the authority table: {0}")]
+    Authority(#[from] uruk_link::authority::AuthorityError),
     #[error("could not listen on {address}: {source}")]
     Listen {
         address: SocketAddr,
@@ -111,6 +117,7 @@ pub async fn run(config: &ServeConfig) -> Result<(), ServeError> {
     let engine = Engine {
         index: Index::open(&config.index_dir)?,
         store: StoreReader::open(&config.crawl_dir)?,
+        authority: Authority::beside_crawl(&config.crawl_dir)?,
     };
     let documents = engine.index.len();
 
@@ -231,8 +238,12 @@ fn run_search(state: &AppState, raw: &str) -> String {
         return html::results(raw, &[], 0, 0.0);
     };
 
+    // Split the borrow: `search` wants the index mutably while the authority
+    // table is read, and they are separate fields of the same guard.
+    let engine = &mut *engine;
     let options = SearchOptions {
         limit: state.results_per_page,
+        authority: engine.authority.as_ref(),
         ..SearchOptions::default()
     };
     let Ok(found) = search(&mut engine.index, &query, &options) else {

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use uruk_index::build::IndexError;
 use uruk_index::index::{DocRef, Index};
 use uruk_index::postings::Posting;
+use uruk_link::Authority;
 
 use crate::parse::Query;
 use crate::score::{CorpusStats, Explanation, Scorer, TermScore, Weights};
@@ -39,17 +40,25 @@ pub enum QueryError {
 
 /// How to run a search.
 #[derive(Debug, Clone)]
-pub struct SearchOptions {
+pub struct SearchOptions<'a> {
     /// Results to return. Ten, because that is the product.
     pub limit: usize,
     pub weights: Weights,
+    /// Host standing from the link graph, if it has been computed.
+    ///
+    /// Optional on purpose: an index can be searched before `uruk link` has
+    /// ever run, and it should rank by text alone rather than refuse. When it
+    /// is absent every result's explanation says "not measured" rather than
+    /// showing a zero that looks like a judgement.
+    pub authority: Option<&'a Authority>,
 }
 
-impl Default for SearchOptions {
+impl Default for SearchOptions<'_> {
     fn default() -> Self {
         Self {
             limit: 10,
             weights: Weights::default(),
+            authority: None,
         }
     }
 }
@@ -106,7 +115,7 @@ impl Ord for Ranked {
 pub fn search(
     index: &mut Index,
     query: &Query,
-    options: &SearchOptions,
+    options: &SearchOptions<'_>,
 ) -> Result<Results, QueryError> {
     let started = Instant::now();
     let mut results = Results {
@@ -144,7 +153,15 @@ pub fn search(
     let mut best: BinaryHeap<Reverse<Ranked>> = BinaryHeap::new();
 
     for segment in 0..u16::try_from(index.segment_count()).unwrap_or(u16::MAX) {
-        let found = search_segment(index, segment, query, &terms, &frequencies, &scorer)?;
+        let found = search_segment(
+            index,
+            segment,
+            query,
+            &terms,
+            &frequencies,
+            &scorer,
+            options.authority,
+        )?;
         results.lists_read += found.lists_read;
         results.matched += found.hits.len();
 
@@ -180,6 +197,7 @@ fn search_segment(
     terms: &[&str],
     frequencies: &[u32],
     scorer: &Scorer,
+    authority: Option<&Authority>,
 ) -> Result<SegmentHits, QueryError> {
     let mut lists_read = 0;
 
@@ -250,7 +268,15 @@ fn search_segment(
             .collect();
 
         let span = closest_span(&postings.iter().map(|p| &p.positions).collect::<Vec<_>>());
-        let explanation = scorer.document(contributions, entry.quality, span);
+        // Authority is a property of the host, so it is looked up once per
+        // document rather than per term, and only for documents that survived
+        // every filter above.
+        let standing = authority.map(|table| {
+            index
+                .host_name(DocRef { segment, doc })
+                .map_or(0.0, |host| table.score(host))
+        });
+        let explanation = scorer.document(contributions, entry.quality, span, standing);
 
         hits.push(Hit {
             doc: DocRef { segment, doc },

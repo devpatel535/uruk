@@ -10,7 +10,8 @@ homepage.workspace = true
 authors.workspace = true
 
 # Justifications:
-#   uruk-query / uruk-index / uruk-crawl - the engine this puts a face on
+#   uruk-query / uruk-index / uruk-link / uruk-crawl - the engine this puts a
+#                  face on
 #   axum + tokio - the HTTP layer. Hand-rolling HTTP for something facing the
 #                  public internet is a security liability, and axum is a thin
 #                  layer over hyper, which is the battle-tested part. It brings
@@ -23,6 +24,7 @@ authors.workspace = true
 [dependencies]
 uruk-crawl = { path = "../uruk-crawl" }
 uruk-index = { path = "../uruk-index" }
+uruk-link = { path = "../uruk-link" }
 uruk-query = { path = "../uruk-query" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }

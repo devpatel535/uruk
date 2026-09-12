@@ -63,8 +63,17 @@ pub struct Weights {
     pub b: [f64; FIELD_COUNT],
     /// How much query terms appearing close together is worth.
     pub proximity: f64,
-    /// How much the content-quality proxies are worth. Deliberately the
-    /// smallest signal: it is a guess about a page, not evidence about a query.
+    /// How much the host's standing in the link graph is worth.
+    ///
+    /// Small, for two reasons `RESEARCH.md` §5.3 sets out. It is the signal
+    /// spam attacks hardest, so a large weight is an invitation. And on a
+    /// topical crawl the link graph is truncated — most in-links to any host
+    /// come from pages we never fetched — so it is also the *weakest* evidence
+    /// available, not merely the most dangerous.
+    pub authority: f64,
+    /// How much the content-quality proxies are worth. The smallest signal:
+    /// it is a guess about a page, not evidence about a query, and unlike
+    /// authority it is not even somebody else's opinion.
     pub quality: f64,
 }
 
@@ -79,6 +88,7 @@ impl Default for Weights {
             k1: DEFAULT_K1,
             b,
             proximity: 0.6,
+            authority: 0.3,
             quality: 0.4,
         }
     }
@@ -146,7 +156,21 @@ pub struct Explanation {
     /// The closest the query terms came, in tokens. `None` for a single-term
     /// query, where proximity is meaningless.
     pub closest_span: Option<u32>,
+    pub authority: AuthorityScore,
     pub quality: QualityScore,
+}
+
+/// What the host's standing in the link graph contributed, and why.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AuthorityScore {
+    /// The host's authority in `0.0..=1.0`, as [`uruk_link::Authority`]
+    /// computed it. Zero when no authority table was supplied, which is not
+    /// the same as a host nobody links to — [`known`](Self::known) tells them
+    /// apart so an explanation can say "not measured" rather than "worthless".
+    pub factor: f64,
+    /// Whether an authority table was consulted at all.
+    pub known: bool,
+    pub contribution: f64,
 }
 
 impl Explanation {
@@ -155,6 +179,7 @@ impl Explanation {
         vec![
             ("text relevance (BM25F)", self.text_relevance),
             ("proximity", self.proximity),
+            ("host authority", self.authority.contribution),
             ("content quality", self.quality.contribution),
         ]
     }
@@ -255,11 +280,17 @@ impl Scorer {
     }
 
     /// Score a document, and say why.
+    ///
+    /// `authority` is the host's standing in `0.0..=1.0`, or `None` when no
+    /// authority table was supplied. `None` and `Some(0.0)` are deliberately
+    /// different: the first means we did not look, the second means we looked
+    /// and nobody links there.
     pub fn document(
         &self,
         terms: Vec<TermScore>,
         quality: DocQuality,
         closest_span: Option<u32>,
+        authority: Option<f64>,
     ) -> Explanation {
         let text_relevance: f64 = terms.iter().map(|term| term.contribution).sum();
 
@@ -274,12 +305,19 @@ impl Scorer {
             contribution: self.weights.quality * factor,
         };
 
+        let authority = AuthorityScore {
+            factor: authority.unwrap_or(0.0).clamp(0.0, 1.0),
+            known: authority.is_some(),
+            contribution: self.weights.authority * authority.unwrap_or(0.0).clamp(0.0, 1.0),
+        };
+
         Explanation {
-            total: text_relevance + proximity + quality.contribution,
+            total: text_relevance + proximity + authority.contribution + quality.contribution,
             text_relevance,
             terms,
             proximity,
             closest_span,
+            authority,
             quality,
         }
     }
@@ -417,9 +455,9 @@ mod tests {
         };
 
         // A span of 1 means the two terms are adjacent.
-        let adjacent = scorer.document(terms.clone(), quality, Some(1));
-        let scattered = scorer.document(terms.clone(), quality, Some(60));
-        let unknown = scorer.document(terms, quality, None);
+        let adjacent = scorer.document(terms.clone(), quality, Some(1), None);
+        let scattered = scorer.document(terms.clone(), quality, Some(60), None);
+        let unknown = scorer.document(terms, quality, None, None);
 
         assert!(adjacent.proximity > scattered.proximity);
         assert!(scattered.proximity > 0.0);
@@ -435,7 +473,13 @@ mod tests {
         let scorer = scorer();
         let terms = vec![scorer.term("clay", 50, counts(Field::Body, 1), lengths(100, 5))];
         let quality = DocQuality::default();
-        assert!(scorer.document(terms, quality, Some(0)).proximity.abs() < f64::EPSILON);
+        assert!(
+            scorer
+                .document(terms, quality, Some(0), None)
+                .proximity
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -454,8 +498,8 @@ mod tests {
             scripts: 40,
         };
 
-        let good = scorer.document(terms.clone(), article, None);
-        let bad = scorer.document(terms, link_farm, None);
+        let good = scorer.document(terms.clone(), article, None, None);
+        let bad = scorer.document(terms, link_farm, None, None);
 
         assert!(good.quality.factor > bad.quality.factor);
         assert!(good.total > bad.total);
@@ -477,16 +521,73 @@ mod tests {
             link_density: 0.2,
             scripts: 5,
         };
-        let explanation = scorer.document(terms, quality, Some(4));
+        // With authority measured, and again without: both have to add up, or
+        // the promise that every result can say why it ranked is a promise
+        // about a number that does not reconcile.
+        for standing in [None, Some(0.0), Some(0.75), Some(1.0)] {
+            let explanation = scorer.document(terms.clone(), quality, Some(4), standing);
 
-        let summed: f64 = explanation.signals().iter().map(|(_, value)| value).sum();
+            let summed: f64 = explanation.signals().iter().map(|(_, value)| value).sum();
+            assert!(
+                (explanation.total - summed).abs() < 1e-12,
+                "parts do not sum to the total with authority {standing:?}"
+            );
+
+            let from_terms: f64 = explanation.terms.iter().map(|t| t.contribution).sum();
+            assert!((explanation.text_relevance - from_terms).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_authority_is_not_the_same_as_a_measured_zero() {
+        // Both contribute nothing to the score, but a result page that says
+        // "0.00" where it should say "not measured" is telling the user the
+        // engine looked and found nothing, which is a different claim.
+        let scorer = Scorer::new(stats(), Weights::default());
+        let terms = vec![scorer.term("clay", 50, counts(Field::Body, 3), lengths(120, 6))];
+        let quality = DocQuality {
+            text_ratio: 0.3,
+            link_density: 0.2,
+            scripts: 5,
+        };
+
+        let unmeasured = scorer.document(terms.clone(), quality, None, None);
+        let measured_zero = scorer.document(terms, quality, None, Some(0.0));
+
+        assert!(!unmeasured.authority.known);
+        assert!(measured_zero.authority.known);
+        assert!((unmeasured.total - measured_zero.total).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn authority_moves_a_result_but_cannot_carry_it() {
+        // The weight is small on purpose. A perfectly authoritative host must
+        // not outrank a page that actually matches the query better.
+        let scorer = Scorer::new(stats(), Weights::default());
+        let quality = DocQuality {
+            text_ratio: 0.4,
+            link_density: 0.1,
+            scripts: 0,
+        };
+
+        let relevant = vec![scorer.term("clay", 50, counts(Field::Body, 8), lengths(120, 6))];
+        let barely = vec![scorer.term("clay", 50, counts(Field::Body, 1), lengths(800, 6))];
+
+        let good_page_no_authority = scorer.document(relevant, quality, None, Some(0.0));
+        let weak_page_best_authority = scorer.document(barely, quality, None, Some(1.0));
+
         assert!(
-            (explanation.total - summed).abs() < 1e-12,
-            "parts do not sum to the total"
+            good_page_no_authority.total > weak_page_best_authority.total,
+            "authority outranked relevance: {} vs {}",
+            good_page_no_authority.total,
+            weak_page_best_authority.total
         );
-
-        let from_terms: f64 = explanation.terms.iter().map(|t| t.contribution).sum();
-        assert!((explanation.text_relevance - from_terms).abs() < 1e-12);
+        // But it is not decorative either: the same page with standing beats
+        // itself without.
+        let terms = vec![scorer.term("clay", 50, counts(Field::Body, 3), lengths(120, 6))];
+        let without = scorer.document(terms.clone(), quality, None, Some(0.0));
+        let with = scorer.document(terms, quality, None, Some(1.0));
+        assert!(with.total > without.total);
     }
 
     #[test]

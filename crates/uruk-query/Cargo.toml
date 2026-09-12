@@ -12,6 +12,7 @@ authors.workspace = true
 # Justifications:
 #   uruk-index - the index this searches
 #   uruk-crawl - the crawl store, for snippets and titles at result time
+#   uruk-link  - the host authority table, read at scoring time
 #   thiserror  - typed errors
 #
 # No scoring or ranking dependency, deliberately. BM25 is about fifteen lines
@@ -20,6 +21,7 @@ authors.workspace = true
 [dependencies]
 uruk-index = { path = "../uruk-index" }
 uruk-crawl = { path = "../uruk-crawl" }
+uruk-link = { path = "../uruk-link" }
 thiserror = "2"
 
 [lints]

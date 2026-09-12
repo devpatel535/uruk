@@ -441,6 +441,111 @@ Phase 6:
 - **Keep the weight small**, as the brief already says. This is the signal spam
   attacks hardest, and on our corpus it's also the weakest signal we have.
 
+#### What Phase 6 actually built, and what it measured
+
+> **Updated after building it.** All four bullets above were implemented in
+> `uruk-link`. The design survived contact; one thing about it surprised me.
+
+`uruk link` collapses a crawl to a **host** graph and scores every host two
+ways. Four kinds of link never become an edge, and the list is more important
+than either algorithm:
+
+| Discarded | Why |
+|---|---|
+| `rel="nofollow"`, `ugc`, `sponsored` | The author explicitly declined to vouch. A crawler that ignores this makes every comment box a ballot. |
+| Self-links, by apex domain | A navigation menu is not evidence. `blog.example.com → shop.example.com` is one site talking to itself. |
+| Repeats within a page | Fifty links to one host from one page is one vote. |
+| Repeats across a host | A host linking to another host is **one edge**, whatever the page count. |
+
+That last row is the whole signal. **In-degree counts distinct source hosts,
+not links.** Without it, authority is a function of how many pages a site has,
+and the cheapest attack on the entire ranking is to generate pages — which is
+precisely the attack that made 2011's web unsearchable.
+
+**Measured on a fixture with a deliberate link farm.** Four hosts: a hub that
+links to two single-page archives, and a farm of sixteen pages that all link to
+its own "best page" and to the hub. Nineteen pages crawled, sixteen of them the
+farm's.
+
+```
+  hosts              4
+  host-to-host edges 5
+
+  links that did not become edges
+    same site                 29
+
+  top hosts by in-degree
+    1. archive A    1.000   in-degree 2   pages 1
+    2. archive B    1.000   in-degree 2   pages 1
+    3. hub          0.631   in-degree 1   pages 1
+    4. the farm     0.000   in-degree 0   pages 16
+```
+
+The farm holds 84% of the corpus and scores **zero**, because all twenty-nine
+of its votes were for itself. The single-page archives score 1.000 because two
+other hosts pointed at them.
+
+And the ranking moves accordingly. For the query `clay tablets`:
+
+| | without `uruk link` | with it |
+|---|---|---|
+| 1 | the farm's stuffed target page | archive A |
+| 2 | archive A | archive B |
+| 3 | archive B | the hub |
+| 4 | the hub | the farm's target page |
+
+Text relevance alone puts the keyword-stuffed page first — correctly, on its own
+terms, because it does repeat the query more. Host authority is what moves the
+two pages a human would have picked above it. That is the signal doing exactly
+the job §5.3 predicted, on a corpus built to be hostile.
+
+**The surprise: the two methods agreed completely.** In-degree and TrustRank
+produced a rank correlation of **1.000** on this graph, so `uruk link` says so
+out loud:
+
+```
+  in-degree vs trustrank: rank correlation 1.000
+    they agree; trustrank is not earning its iterations here
+```
+
+A four-host fixture is far too small to conclude anything about the web from,
+and I am not claiming otherwise. But it makes the operational point concrete:
+the expensive method has to *demonstrate* a difference before it is worth
+running, and on small graphs there is often no difference to find. This is why
+**in-degree is the default**, both are always computed and stored, and the
+report prints the correlation on every run. Najork, Zaragoza and Taylor's 2007
+result — BM25F plus in-degree beating BM25F plus PageRank — is the prior here,
+and nothing so far argues against it.
+
+**Two things worth knowing about the implementation:**
+
+*The iteration cap was wrong, and silently so.* Power iteration contracts by a
+factor of the damping each step, so reaching a residual of 1e-9 at damping 0.85
+needs about 128 iterations. The cap was 100. The scores it produced were close
+enough to look correct while `converged` was never true. It was caught only
+because a test asserted convergence rather than assuming it; the iteration
+count is now derived from the damping rather than guessed, and a test pins the
+relationship across four damping values. This is the second time in this
+project a wrong constant produced plausible output instead of an error, which
+is a pattern worth naming: **numbers that are nearly right are harder to find
+than numbers that are absent.**
+
+*Same-site detection is an approximation with a known bias.* Without a Public
+Suffix List, "same site" is "the last two labels match". That is wrong for
+`example.co.uk` (two unrelated British sites look like one) and for
+`*.github.io` (two unrelated projects look like one). Both errors **discard
+votes that should have counted**; neither *creates* a vote. The asymmetry is
+deliberate — an undercounting signal is weak, an overcounting one is an attack
+surface — and there is a test pinning the known-wrong cases so that adopting a
+real suffix list has a failing test to flip. Shipping the list is a licensing
+and update-cadence decision, not a code change.
+
+**Still not done, and deliberately:** anchor text as an index field. The link
+graph now makes it available — anchors are stored per edge — but adding a
+fifth field changes the segment format again, and §5.4's argument stands: it
+should be added with a judged query set in place to measure whether it helps,
+not before.
+
 ### 5.4 No click data means curation is the product
 
 Section 8 rules out click-through rate, dwell time and personalisation. I agree

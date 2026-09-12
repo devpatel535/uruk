@@ -16,6 +16,7 @@ path = "src/main.rs"
 # Justifications:
 #   uruk-crawl - the crawler this binary drives
 #   uruk-index - the indexer
+#   uruk-link  - the link graph and host authority
 #   uruk-query - the query engine
 #   uruk-serve - the web front end
 #   clap       - argument parsing. Hand-rolling it was the alternative; clap
@@ -26,6 +27,7 @@ path = "src/main.rs"
 [dependencies]
 uruk-crawl = { path = "../uruk-crawl" }
 uruk-index = { path = "../uruk-index" }
+uruk-link = { path = "../uruk-link" }
 uruk-query = { path = "../uruk-query" }
 uruk-serve = { path = "../uruk-serve" }
 clap = { version = "4", features = ["derive"] }

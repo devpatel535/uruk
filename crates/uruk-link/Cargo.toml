@@ -1,0 +1,28 @@
+[package]
+name = "uruk-link"
+description = "Uruk's link graph: who links to whom, collapsed to hosts, and how much that is worth."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# Justifications:
+#   uruk-crawl - reads the crawl store, which is where the links already are
+#   serde      - the authority table is JSON, so a human can read why a host
+#                scored what it did without writing a tool
+#   thiserror  - typed errors
+#
+# Note what is absent: no graph library. The graph here is an adjacency list of
+# a few hundred thousand hosts at most, and the two algorithms are counting and
+# a power iteration. A dependency would hide both.
+[dependencies]
+uruk-crawl = { path = "../uruk-crawl" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[lints]
+workspace = true

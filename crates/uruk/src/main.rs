@@ -14,6 +14,8 @@ use uruk_crawl::store::{CrawlSummary, StoreReader};
 use uruk_crawl::traps::Limits;
 use uruk_index::build::{self, IndexConfig};
 use uruk_index::index::Index;
+use uruk_link::authority::{self, Authority, Method, rank_correlation};
+use uruk_link::graph::HostGraph;
 use uruk_query::parse;
 use uruk_query::search::{self, SearchOptions};
 use uruk_query::snippet::{self, SnippetPolicy};
@@ -34,10 +36,63 @@ enum Command {
     Crawl(CrawlArgs),
     /// Turn a crawl into a searchable index.
     Index(IndexArgs),
+    /// Build the host link graph and score every host's authority.
+    Link(LinkArgs),
     /// Search an index.
     Search(SearchArgs),
     /// Serve the web front end.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct LinkArgs {
+    /// Directory holding a crawl store.
+    #[arg(short, long, value_name = "DIR", default_value = "data/crawl")]
+    crawl: PathBuf,
+
+    /// The crawl's seed file. Its hosts become the trust root for trustrank;
+    /// without it there is nothing to propagate from and the result degrades
+    /// to plain pagerank, which the report says plainly rather than hiding.
+    #[arg(short, long, value_name = "FILE")]
+    seeds: Option<PathBuf>,
+
+    /// Where to write the authority table. Defaults to `authority.json` inside
+    /// the crawl directory, which is where `search` and `serve` look for it.
+    #[arg(short, long, value_name = "FILE")]
+    out: Option<PathBuf>,
+
+    /// Which signal to store as the one the ranker should use.
+    ///
+    /// Both are always computed. In-degree is the default because
+    /// RESEARCH.md 5.3 puts the burden of proof on the expensive method, and
+    /// the judged query set that would settle it does not exist yet.
+    #[arg(short, long, value_enum, default_value_t = MethodArg::InDegree)]
+    method: MethodArg,
+
+    /// Random-surfer damping for trustrank.
+    #[arg(long, default_value_t = authority::DEFAULT_DAMPING)]
+    damping: f64,
+
+    /// Hosts to list in the report.
+    #[arg(short = 'n', long, default_value_t = 20)]
+    top: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MethodArg {
+    /// Distinct hosts linking here. The baseline.
+    InDegree,
+    /// Trust propagated from the crawl's seeds.
+    TrustRank,
+}
+
+impl From<MethodArg> for Method {
+    fn from(value: MethodArg) -> Self {
+        match value {
+            MethodArg::InDegree => Self::InDegree,
+            MethodArg::TrustRank => Self::TrustRank,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -159,6 +214,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Crawl(args) => finish(run_crawl(args)),
         Command::Index(args) => finish(run_index(&args)),
+        Command::Link(args) => finish(run_link(&args)),
         Command::Search(args) => finish(run_search(&args)),
         Command::Serve(args) => finish(run_serve(&args)),
     }
@@ -251,6 +307,128 @@ fn run_index(args: &IndexArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the host link graph and write the authority table.
+///
+/// The report is deliberately noisy about what it *discarded*. A link graph
+/// that looks healthy while silently dropping every edge is the failure mode
+/// here, and the only way to notice is to print the counts.
+fn run_link(args: &LinkArgs) -> Result<(), String> {
+    let mut store = StoreReader::open(&args.crawl).map_err(|error| {
+        format!(
+            "could not open the crawl store at {}: {error}",
+            args.crawl.display()
+        )
+    })?;
+
+    // `read_seeds` validates and returns parsed URLs; the graph only wants
+    // their hosts, so hand it the strings back.
+    let seeds: Vec<String> = match &args.seeds {
+        Some(path) => read_seeds(path)?
+            .into_iter()
+            .map(|url| url.to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let graph = HostGraph::build(&mut store, &seeds)
+        .map_err(|error| format!("could not read the crawl: {error}"))?;
+
+    if graph.is_empty() {
+        return Err(format!(
+            "the crawl at {} has no pages, so there is no graph to build",
+            args.crawl.display()
+        ));
+    }
+
+    let method: Method = args.method.into();
+    let table = Authority::compute(&graph, method, args.damping);
+
+    let out = args
+        .out
+        .clone()
+        .unwrap_or_else(|| args.crawl.join("authority.json"));
+    table
+        .write(&out)
+        .map_err(|error| format!("could not write the authority table: {error}"))?;
+
+    report_graph(&graph, &table, args.top);
+    println!("\nwritten to {}", out.display());
+    Ok(())
+}
+
+fn report_graph(graph: &HostGraph, table: &Authority, top: usize) {
+    println!();
+    println!("  hosts              {}", graph.len());
+    println!("  host-to-host edges {}", graph.edges());
+    println!("  seeds (trust root) {}", graph.seeds().count());
+
+    let dropped = graph.dropped;
+    println!("\n  links that did not become edges");
+    println!("    nofollow           {:>9}", dropped.nofollow);
+    println!("    same site          {:>9}", dropped.same_site);
+    println!("    repeat on a page   {:>9}", dropped.repeat);
+    println!("    unparseable        {:>9}", dropped.unparseable);
+
+    let convergence = table.convergence;
+    println!("\n  trustrank");
+    if convergence.trust_root_was_empty {
+        println!("    no seed hosts: this is PageRank, not TrustRank");
+    }
+    if convergence.converged {
+        println!(
+            "    converged in {} iterations (residual {:.2e})",
+            convergence.iterations, convergence.residual
+        );
+    } else {
+        println!(
+            "    DID NOT CONVERGE in {} iterations (residual {:.2e})",
+            convergence.iterations, convergence.residual
+        );
+    }
+
+    // How much the two methods disagree. If they agree almost perfectly the
+    // expensive one is not earning its iterations, whatever a judged query set
+    // later says about which is better.
+    let by_degree = Authority {
+        method: Method::InDegree,
+        ..table.clone()
+    };
+    let by_trust = Authority {
+        method: Method::TrustRank,
+        ..table.clone()
+    };
+    let degree_ranking = by_degree.ranking();
+    let trust_ranking = by_trust.ranking();
+    if let Some(correlation) = rank_correlation(&degree_ranking, &trust_ranking) {
+        println!("\n  in-degree vs trustrank: rank correlation {correlation:.3}");
+        if correlation > 0.99 {
+            println!("    they agree; trustrank is not earning its iterations here");
+        }
+    }
+
+    let ranking = table.ranking();
+    let shown = top.min(ranking.len());
+    println!(
+        "\n  top {shown} hosts by {}",
+        match table.method {
+            Method::InDegree => "in-degree",
+            Method::TrustRank => "trustrank",
+        }
+    );
+    for (rank, (host, score)) in ranking.iter().take(shown).enumerate() {
+        let entry = table.hosts.get(*host).copied().unwrap_or_default();
+        println!(
+            "  {:>3}. {:<40} {:.3}   in-degree {:<5} pages {:<5} trust {:.6}",
+            rank + 1,
+            host,
+            score,
+            entry.in_degree,
+            entry.pages,
+            entry.trust
+        );
+    }
+}
+
 fn run_search(args: &SearchArgs) -> Result<(), String> {
     let raw = args.query.join(" ");
     let query = parse::parse(&raw);
@@ -264,8 +442,13 @@ fn run_search(args: &SearchArgs) -> Result<(), String> {
             args.index.display()
         )
     })?;
+    // Host authority if `uruk link` has been run, text-only ranking if not.
+    // Absent is not an error: an index is searchable the moment it is built.
+    let authority = Authority::beside_crawl(&args.crawl)
+        .map_err(|error| format!("could not read the authority table: {error}"))?;
     let options = SearchOptions {
         limit: args.limit.max(1),
+        authority: authority.as_ref(),
         ..SearchOptions::default()
     };
     let results = search::search(&mut index, &query, &options)
@@ -350,6 +533,21 @@ fn explain(hit: &search::Hit) {
     }
     if let Some(span) = hit.explanation.closest_span {
         println!("      {:<16} terms came within {span} tokens", "proximity");
+    }
+    let authority = &hit.explanation.authority;
+    if authority.known {
+        println!(
+            "      {:<16} host standing {:.3}  ->  {:.3}",
+            "authority", authority.factor, authority.contribution
+        );
+    } else {
+        // Saying nothing here would look like a host nobody links to. It is
+        // not: it is a signal that was never computed, and `uruk link` is how
+        // it gets computed.
+        println!(
+            "      {:<16} not measured (run `uruk link` to build the graph)",
+            "authority"
+        );
     }
     let quality = &hit.explanation.quality;
     println!(

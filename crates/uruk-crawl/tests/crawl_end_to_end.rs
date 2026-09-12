@@ -494,6 +494,81 @@ async fn the_summary_adds_up() {
     );
 }
 
+/// Every seed is used, not just the first one that works.
+///
+/// This is a regression test for a bug that survived the whole of Phase 1:
+/// seeds were pushed with `Iterator::any`, which stops at the first `true`, so
+/// a crawl given ten seeds visited one of them and reported success. Every
+/// other test in this file uses a single seed, which is exactly why none of
+/// them noticed.
+///
+/// The three servers bind to *different loopback addresses* rather than
+/// different ports on one. That is not fussiness: [`url::dedupe_key`] leaves
+/// the port out, deliberately, so three seeds differing only by port are one
+/// URL as far as the frontier is concerned and the second two are refused as
+/// already seen. Different addresses make them genuinely different hosts,
+/// which is also what a real seed list looks like.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_seed_is_crawled_not_just_the_first() {
+    let addresses = ["127.0.0.1", "127.0.0.2", "127.0.0.3"];
+    let mut seeds = Vec::new();
+    let mut logs = Vec::new();
+    let mut servers = Vec::new();
+    for address in addresses {
+        let listener = TcpListener::bind(format!("{address}:0"))
+            .await
+            .unwrap_or_else(|error| panic!("could not bind {address}: {error}"));
+        let port = listener.local_addr().expect("addr").port();
+        // `/articles/tablets` rather than `/`, so each seed is a real page.
+        seeds.push(Url::parse(&format!("http://{address}:{port}/articles/tablets")).unwrap());
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        logs.push(Arc::clone(&log));
+        servers.push(tokio::spawn(serve(listener, log)));
+    }
+
+    let dir = std::env::temp_dir().join(format!("uruk-e2e-seeds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let summary = crawler::run(CrawlConfig {
+        seeds,
+        out_dir: dir.clone(),
+        max_pages: 30,
+        limits: Limits::default(),
+        host_delay: Duration::from_millis(50),
+        concurrency: 4,
+        user_agent: crawler::DEFAULT_USER_AGENT.to_owned(),
+        progress: false,
+    })
+    .await
+    .expect("crawl should succeed");
+
+    for server in servers {
+        server.abort();
+    }
+
+    for (index, log) in logs.iter().enumerate() {
+        let paths: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path == "/articles/tablets"),
+            "seed {index} ({}) was never fetched; it received: {paths:?}",
+            addresses[index]
+        );
+    }
+    assert_eq!(
+        summary.hosts,
+        addresses.len(),
+        "the crawl saw {} of {} seed hosts, so seeds were dropped",
+        summary.hosts,
+        addresses.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A crawl with no usable seeds should say so rather than sit there.
 #[tokio::test]
 async fn refuses_to_start_without_seeds() {
