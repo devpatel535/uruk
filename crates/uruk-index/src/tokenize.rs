@@ -41,6 +41,14 @@ pub struct Token {
     /// Ordinal within this field's token stream, counting from zero. Phrase
     /// search compares these; proximity scoring measures gaps between them.
     pub position: u32,
+    /// Byte offset of the token in the original text.
+    ///
+    /// The index does not need this — positions are what postings store — but
+    /// snippets do: showing the matching sentence means cutting the *original*
+    /// text, punctuation and capitals intact, not reassembling terms.
+    pub start: usize,
+    /// Byte offset just past the token in the original text.
+    pub end: usize,
 }
 
 /// Is this worth an entry in the term dictionary?
@@ -69,8 +77,13 @@ pub fn tokenize(text: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut position = 0u32;
     let mut current = String::new();
+    // Byte offset where the token being built started in the original text.
+    let mut start = 0usize;
 
-    let flush = |current: &mut String, position: &mut u32, tokens: &mut Vec<Token>| {
+    let flush = |current: &mut String,
+                 position: &mut u32,
+                 span: (usize, usize),
+                 tokens: &mut Vec<Token>| {
         if current.is_empty() {
             return;
         }
@@ -78,6 +91,8 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             tokens.push(Token {
                 term: std::mem::take(current),
                 position: *position,
+                start: span.0,
+                end: span.1,
             });
         } else {
             current.clear();
@@ -86,8 +101,11 @@ pub fn tokenize(text: &str) -> Vec<Token> {
         *position += 1;
     };
 
-    for ch in text.chars() {
+    for (offset, ch) in text.char_indices() {
         if ch.is_alphanumeric() {
+            if current.is_empty() {
+                start = offset;
+            }
             // Lowercasing is per-character; a few characters (ß, İ) expand to
             // several, which `to_lowercase` handles and `to_ascii_lowercase`
             // would not.
@@ -99,10 +117,15 @@ pub fn tokenize(text: &str) -> Vec<Token> {
                 current.truncate(MAX_TERM_LEN + 1);
             }
         } else {
-            flush(&mut current, &mut position, &mut tokens);
+            flush(&mut current, &mut position, (start, offset), &mut tokens);
         }
     }
-    flush(&mut current, &mut position, &mut tokens);
+    flush(
+        &mut current,
+        &mut position,
+        (start, text.len()),
+        &mut tokens,
+    );
     tokens
 }
 
@@ -187,6 +210,29 @@ mod tests {
             tokens[1].position, 2,
             "the junk token should have consumed position 1"
         );
+    }
+
+    #[test]
+    fn byte_offsets_point_back_at_the_original_text() {
+        // Snippets cut the original, so the offsets have to be exact.
+        let text = "The scribes of Uruk, pressing reed.";
+        for token in tokenize(text) {
+            assert_eq!(
+                text[token.start..token.end].to_lowercase(),
+                token.term,
+                "offsets for {:?} do not match",
+                token.term
+            );
+        }
+    }
+
+    #[test]
+    fn offsets_are_correct_with_multibyte_characters() {
+        let text = "café au lait — très bon";
+        for token in tokenize(text) {
+            // Slicing must land on character boundaries or this panics.
+            assert!(!text[token.start..token.end].is_empty());
+        }
     }
 
     #[test]

@@ -59,6 +59,14 @@ pub fn read_varint(input: &[u8], cursor: &mut usize) -> Option<u64> {
 }
 
 /// One document's entry in a term's posting list.
+///
+/// # Invariant
+///
+/// `positions.len() == counts.total()`. Every occurrence counted in a field
+/// contributes exactly one position, so storing the number of positions
+/// separately would be storing the same number twice. [`encode`] relies on
+/// this to leave it out, which measurement showed is worth about a byte per
+/// posting — roughly a seventh of the whole postings section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posting {
     /// Document id within this segment.
@@ -66,11 +74,16 @@ pub struct Posting {
     /// How often the term appears, per field. `BM25F` combines these rather
     /// than scoring each field separately (`RESEARCH.md` §2.4).
     pub counts: FieldCounts,
-    /// Where the term appears in the body, in token positions.
+    /// Where the term appears, in token positions.
     ///
-    /// Body only. Phrase and proximity matching are body concerns, and storing
-    /// positions for every field would roughly double the largest component of
-    /// the index for a feature nothing uses.
+    /// Fields share one position space, separated by a gap wide enough that no
+    /// phrase can straddle two of them. That is what lets `"clay tablets"`
+    /// match a page *titled* "Clay tablets" — keeping positions for the body
+    /// alone would have made a quoted title unsearchable, which is not a
+    /// limitation the brief's promise about phrase search survives.
+    ///
+    /// The extra cost is small: a title, its headings and a URL come to a few
+    /// dozen tokens against a body of hundreds.
     pub positions: Vec<u32>,
 }
 
@@ -94,15 +107,25 @@ impl Posting {
 /// The list must be sorted by document id; delta encoding depends on it, and
 /// so does the skipping a query does at read time.
 ///
+/// The number of positions is **not** written: it equals the sum of the field
+/// counts, which is already there. See the invariant on [`Posting`].
+///
 /// # Panics
 ///
-/// Debug builds assert the ordering, because an unsorted list produces an
-/// index that decodes without error and returns wrong answers, which is far
-/// worse than a crash.
+/// Debug builds assert the ordering and the position invariant. An unsorted
+/// list, or one whose positions disagree with its counts, produces an index
+/// that decodes without error and returns wrong answers, which is far worse
+/// than a crash.
 pub fn encode(postings: &[Posting], out: &mut Vec<u8>) {
     debug_assert!(
         postings.windows(2).all(|pair| pair[0].doc < pair[1].doc),
         "posting lists must be sorted by document id and free of duplicates"
+    );
+    debug_assert!(
+        postings
+            .iter()
+            .all(|posting| posting.positions.len() as u64 == u64::from(posting.counts.total())),
+        "a posting's position count must equal the sum of its field counts"
     );
 
     write_varint(out, postings.len() as u64);
@@ -123,7 +146,7 @@ pub fn encode(postings: &[Posting], out: &mut Vec<u8>) {
             }
         }
 
-        write_varint(out, posting.positions.len() as u64);
+        // Deliberately no position count: it is `counts.total()`.
         let mut previous_position = 0u32;
         for &position in &posting.positions {
             write_varint(out, u64::from(position - previous_position));
@@ -180,10 +203,8 @@ pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeEr
             }
         }
 
-        let positions_len =
-            read_varint(input, cursor).ok_or_else(|| fail(*cursor, "truncated position count"))?;
-        let positions_len =
-            usize::try_from(positions_len).map_err(|_| fail(*cursor, "implausible positions"))?;
+        // Recovered from the counts rather than stored; see `Posting`.
+        let positions_len = counts.total() as usize;
         if positions_len > input.len().saturating_sub(*cursor) + 1 {
             return Err(fail(*cursor, "positions exceed the remaining bytes"));
         }
@@ -274,11 +295,12 @@ mod tests {
         assert_eq!(read_varint(&bytes, &mut cursor), None);
     }
 
+    /// Postings obeying the invariant: one position per counted occurrence.
     fn sample() -> Vec<Posting> {
         let mut first = Posting::new(3);
         first.counts.set(Field::Body, 4);
         first.counts.set(Field::Title, 1);
-        first.positions = vec![0, 7, 19, 400];
+        first.positions = vec![0, 7, 19, 400, 5_000];
 
         let mut second = Posting::new(1_000_004);
         second.counts.set(Field::Body, 1);
@@ -286,6 +308,7 @@ mod tests {
 
         let mut third = Posting::new(1_000_005);
         third.counts.set(Field::Url, 1);
+        third.positions = vec![3_200];
 
         vec![first, second, third]
     }
@@ -331,11 +354,14 @@ mod tests {
         // A term only in the body should not pay for three zero counts.
         let mut body_only = Posting::new(0);
         body_only.counts.set(Field::Body, 1);
+        body_only.positions = vec![4];
 
         let mut all_fields = Posting::new(0);
         for field in Field::ALL {
             all_fields.counts.set(field, 1);
         }
+        // One position per counted occurrence, as the invariant requires.
+        all_fields.positions = vec![4, 1_004, 2_004, 3_004];
 
         let (mut lean, mut fat) = (Vec::new(), Vec::new());
         encode(std::slice::from_ref(&body_only), &mut lean);
@@ -344,6 +370,23 @@ mod tests {
             lean.len() < fat.len(),
             "the field mask is not saving anything"
         );
+    }
+
+    #[test]
+    fn the_position_count_is_not_stored_twice() {
+        // It equals the sum of the field counts, so writing it would be a
+        // wasted byte on every posting in the index.
+        let mut one = Posting::new(0);
+        one.counts.set(Field::Body, 1);
+        one.positions = vec![7];
+
+        let mut buffer = Vec::new();
+        encode(std::slice::from_ref(&one), &mut buffer);
+        // count(1) + docgap(1) + mask(1) + bodycount(1) + position(1) = 5.
+        assert_eq!(buffer.len(), 5, "unexpected encoding: {buffer:?}");
+
+        let mut cursor = 0;
+        assert_eq!(decode(&buffer, &mut cursor).unwrap(), vec![one]);
     }
 
     #[test]

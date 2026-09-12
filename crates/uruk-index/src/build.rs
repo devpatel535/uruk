@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uruk_crawl::store::{StoreError, StoreReader};
 
-use crate::segment::{Document, SegmentBuilder, SegmentError, SegmentManifest};
+use crate::segment::{DocQuality, Document, SegmentBuilder, SegmentError, SegmentManifest};
 
 /// Documents per segment.
 ///
@@ -71,6 +71,8 @@ pub struct IndexManifest {
     pub bytes_total: u64,
     pub bytes_postings: u64,
     pub bytes_dictionary: u64,
+    #[serde(default)]
+    pub bytes_hosts: u64,
     pub bytes_doc_table: u64,
     /// Bytes of extracted text indexed, so the size of the index can be quoted
     /// as a fraction of it — the number `RESEARCH.md` §6 argues about.
@@ -100,6 +102,7 @@ impl IndexManifest {
         self.bytes_total += segment.bytes_total;
         self.bytes_postings += segment.bytes_postings;
         self.bytes_dictionary += segment.bytes_dictionary;
+        self.bytes_hosts += segment.bytes_hosts;
         self.bytes_doc_table += segment.bytes_doc_table;
     }
 }
@@ -134,6 +137,14 @@ pub fn build(config: &IndexConfig) -> Result<IndexManifest, IndexError> {
             title: &record.title,
             headings: &record.headings,
             body: &record.text,
+            host: host_of(&record.url),
+            quality: DocQuality {
+                #[expect(clippy::cast_possible_truncation, reason = "f64 to f32 for storage")]
+                text_ratio: record.quality.text_ratio as f32,
+                #[expect(clippy::cast_possible_truncation, reason = "f64 to f32 for storage")]
+                link_density: record.quality.link_density as f32,
+                scripts: u32::try_from(record.quality.scripts).unwrap_or(u32::MAX),
+            },
         });
 
         if builder.len() >= config.docs_per_segment {
@@ -179,6 +190,26 @@ fn flush(
     manifest.absorb(&written, name);
     *builder = SegmentBuilder::new();
     Ok(())
+}
+
+/// The host part of a URL, for `site:` filtering.
+///
+/// Deliberately a string slice rather than a parse: the crawler already
+/// normalised and validated these URLs, so a second full parse per document
+/// would be paid for nothing.
+fn host_of(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    // Drop any userinfo and port.
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host)
 }
 
 /// Read an index's manifest without opening its segments.
@@ -252,6 +283,16 @@ mod tests {
         .unwrap();
 
         (crawl_dir, index_dir)
+    }
+
+    #[test]
+    fn hosts_are_extracted_from_urls() {
+        use super::host_of;
+        assert_eq!(host_of("https://a.test/blog/post"), "a.test");
+        assert_eq!(host_of("http://a.test:8080/p?x=1"), "a.test");
+        assert_eq!(host_of("https://user@a.test/p"), "a.test");
+        assert_eq!(host_of("https://a.test"), "a.test");
+        assert_eq!(host_of("a.test/p"), "a.test");
     }
 
     #[test]

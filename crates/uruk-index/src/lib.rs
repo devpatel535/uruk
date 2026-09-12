@@ -7,6 +7,7 @@
 
 pub mod build;
 pub mod fields;
+pub mod index;
 pub mod postings;
 pub mod segment;
 pub mod tokenize;

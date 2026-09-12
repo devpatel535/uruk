@@ -1657,6 +1657,8 @@ dependencies = [
  "tokio",
  "url",
  "uruk-crawl",
+ "uruk-index",
+ "uruk-query",
 ]
 
 [[package]]
@@ -1683,6 +1685,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uruk-crawl",
+]
+
+[[package]]
+name = "uruk-query"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "uruk-crawl",
+ "uruk-index",
 ]
 
 [[package]]

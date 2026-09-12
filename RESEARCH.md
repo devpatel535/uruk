@@ -598,61 +598,112 @@ six. Worth a decision; I'd take it.
 
 ## 6. What "small on disk" actually means, in numbers
 
-The brief is already honest that an index is inherently large. Here is the
-arithmetic so we're arguing about real numbers.
+> **Updated after building it.** This section originally contained an
+> estimate. The indexer now exists, so the estimate has been replaced with a
+> measurement — and the estimate was wrong, in the direction that matters.
 
-**Assumptions**, which are conservative for article-style pages: average clean
-extracted text of 6 KB (~1,000 words) per document; ~1,000 tokens per document;
-~400 distinct terms per document.
+### What was estimated
 
-**Per one million documents:**
+Assuming ~6 KB of clean text per page, ~1,000 tokens and ~400 distinct terms,
+I projected postings at 1.0–1.5 bytes each, positions at ~1–1.5 bytes each, and
+a total of **~3.5 GB per million pages**, with the index at **25–37%** of the
+extracted text once positions were included.
 
-| Component | Size | Notes |
+### What was measured
+
+`cargo run --release --example index_size -p uruk-index -- 20000` builds a
+synthetic corpus with the statistics real prose has — a Zipf-distributed
+vocabulary, which is what decides how well delta encoding does — and indexes
+it. On 20,000 documents averaging 5.8 KB of text:
+
+| Component | Size | % of extracted text |
 |---|---|---|
-| Raw HTML downloaded | ~50 GB | Discarded after extraction; never stored |
-| Clean extracted text | ~6 GB | This is the baseline everything else is measured against |
-| Document store (Zstd, block-compressed) | ~1.6 GB | English prose compresses ~3.5–4× |
-| Postings: doc IDs + frequencies | ~0.4–0.6 GB | 400M postings at ~1.0–1.5 bytes each |
-| Positions | ~1.0–1.5 GB | 1 billion entries; **the single largest component** |
-| Term dictionary (front-coded) | ~0.05–0.1 GB | A few million distinct terms |
-| **Total on disk** | **~3.1–3.8 GB** | Call it **3.5 GB per million pages** |
+| Extracted text | 116.6 MB | 100% |
+| Crawl store (Zstd, block-compressed) | 41.4 MB | 35.5% |
+| **Index total** | **57.0 MB** | **48.9%** |
+|   postings | 56.2 MB | 48.2% |
+|   term dictionary (front-coded) | 0.5 MB | 0.4% |
+|   host + document tables | 0.25 MB | 0.2% |
 
-**What that means for the brief's target.** Section 7 hopes for 15–25% of raw
-text size. Measured against the 6 GB of clean text:
+**5.72 bytes per posting**, and **5.2 KB per page** for store and index
+together — which extrapolates to roughly **4.8 GB per million pages**, about
+a third worse than estimated.
 
-- doc IDs + frequencies alone: **7–10%** — better than the target;
-- with positions: **25–37%** — above the target, and positions are what make
-  phrase search work, so this is the price of a feature you've explicitly asked
-  for;
-- including the document store for snippets: **~58%**.
+Re-run at 100,000 documents the figures are unchanged: 5.72 bytes per posting,
+48.7% of text, 5,144 bytes per page. The extrapolation is a stable ratio rather
+than one data point — the term dictionary halves as a share of the index (0.4%
+to 0.2%) as it amortises, and everything else holds.
 
-So the 15–25% figure is achievable for a positionless index and optimistic for
-the index we actually want. I'd restate the goal as **"under 4 KB on disk per
-indexed page, everything included"** — it's concrete, it's measurable from day
-one, and it's the number that determines whether the index fits anywhere.
+### Why the estimate was wrong
 
-**Scaling, and what it implies for the questions in Section 15:**
+Two things I did not cost:
 
-| Corpus | Total on disk | Fits where |
+- **Per-posting overhead.** Every posting carries a field bitmask and at least
+  one count, which is two bytes before any document id or position is written.
+  At roughly 515 postings per document that is over a kilobyte per page spent
+  on bookkeeping.
+- **Positions cost two bytes, not one.** Body positions run to ~800, and
+  variable-byte encoding needs a second byte above 127. I had assumed roughly
+  one byte each.
+
+One byte of the original figure has already been recovered: the encoder used
+to store the number of positions in each posting, which is exactly the sum of
+the field counts sitting next to it. Removing it took the index from 57.3% to
+48.9% of the text, which is a good illustration of how much a byte per posting
+is worth at this scale.
+
+### What this means for Phase 5
+
+The measurement points straight at the work. Variable-byte is a per-value
+encoding, and almost half the index is now per-posting fixed cost that a
+per-value encoding cannot amortise. The single biggest lever is **block-based
+encoding** in the Lucene style: cut postings into fixed blocks of 128
+documents, bit-pack each block at the width its largest value actually needs,
+and hoist the field mask out of the per-posting path. Positions of ~800 need
+ten bits, not sixteen.
+
+That is precisely the Phase 5 work the brief asks for, and the harness to
+measure it now exists: `examples/index_size.rs` prints the postings line that
+Simple-9, `PForDelta` and Elias-Fano have to beat. **5.72 bytes per posting is
+the number to improve on.**
+
+### Scaling, and the brief's target
+
+Against the brief's hope of 15–25% of raw text, the honest position is:
+
+- a **positionless** index would land near the target, but would give up
+  phrase search and proximity, which the brief explicitly wants;
+- the index we actually want is at **49%** today, and block encoding should
+  bring it substantially down — but 15–25% with positions is not a target I
+  would promise before it is measured.
+
+I'd restate the goal as a number that can be checked on every build: **under
+4 KB on disk per indexed page, everything included.** Today it is 5.2 KB.
+
+| Corpus | Store + index today | Fits where |
 |---|---|---|
-| 100,000 pages | ~350 MB | Anywhere. Ships as a download. |
-| 1 million pages | ~3.5 GB | A laptop. Offline personal search is genuinely practical. |
-| 10 million pages | ~35 GB | A desktop or a cheap VPS with a decent disk. |
-| 100 million pages | ~350 GB | A dedicated machine. Shippable to users: no. |
-| 1 billion pages | ~3.5 TB | A small rack, and a different project. |
+| 100,000 pages | ~0.5 GB | Anywhere. Ships as a download. |
+| 1 million pages | ~4.8 GB | A laptop. Offline personal search is practical. |
+| 10 million pages | ~48 GB | A desktop or a cheap VPS with a decent disk. |
+| 100 million pages | ~480 GB | A dedicated machine. Shippable to users: no. |
+| 1 billion pages | ~4.8 TB | A small rack, and a different project. |
 
-That directly answers your fourth Section 15 question. **A shippable offline
-index is realistic up to about 1–10 million pages and stops being realistic
-above that.** It's a real fork in the road: if fully offline private search
-matters to you, it caps the corpus, and the corpus cap has to be chosen before
-the index format is designed, because a shippable index wants a single-file
-format with different trade-offs than a server-side one.
+That still answers your fourth Section 15 question the same way: **a shippable
+offline index is realistic up to about 1–10 million pages and stops being
+realistic above that.** The corpus cap has to be chosen before the index format
+is finalised, because a shippable index wants a single-file format with
+different trade-offs than a server-side one.
 
 **Crawl time**, for calibration: at one request per host every 3 seconds but
 fetching many hosts in parallel, a single machine comfortably sustains 50–100
 pages/second. One million pages is about 3–6 hours of wall-clock fetching; ten
 million is a couple of days. Bandwidth, not politeness, is the limit, and 1M
 pages is roughly 50 GB downloaded. This is all very tractable.
+
+**Indexing time**, measured: 20,000 documents in 27 seconds and 100,000 in 129
+seconds, single-threaded — so it scales linearly at about 775 pages a second,
+and a million pages is a little over twenty minutes. Indexing is not the
+bottleneck and does not need to be parallel yet.
 
 ---
 

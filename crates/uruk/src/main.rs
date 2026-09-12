@@ -1,7 +1,7 @@
 //! `uruk` — the command-line entry point.
 //!
-//! One subcommand per component, added as each phase is built. `crawl` is
-//! here; `index`, `query` and `serve` follow.
+//! One subcommand per component, added as each phase is built. `crawl`,
+//! `index` and `search` are here; `serve` follows.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,8 +11,13 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use uruk_crawl::crawler::{self, CrawlConfig, DEFAULT_USER_AGENT};
-use uruk_crawl::store::CrawlSummary;
+use uruk_crawl::store::{CrawlSummary, StoreReader};
 use uruk_crawl::traps::Limits;
+use uruk_index::build::{self, IndexConfig};
+use uruk_index::index::Index;
+use uruk_query::parse;
+use uruk_query::search::{self, SearchOptions};
+use uruk_query::snippet::{self, SnippetPolicy};
 
 const TAGLINE: &str = "A search engine that returns links, not answers.";
 
@@ -27,6 +32,57 @@ struct Cli {
 enum Command {
     /// Fetch pages politely, extract their text, and store it compressed.
     Crawl(CrawlArgs),
+    /// Turn a crawl into a searchable index.
+    Index(IndexArgs),
+    /// Search an index.
+    Search(SearchArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct IndexArgs {
+    /// Directory holding a crawl store.
+    #[arg(short, long, value_name = "DIR", default_value = "data/crawl")]
+    crawl: PathBuf,
+
+    /// Directory to write index segments into.
+    #[arg(short, long, value_name = "DIR", default_value = "data/index")]
+    out: PathBuf,
+
+    /// Documents per segment. Bounds peak memory while indexing.
+    #[arg(long, default_value_t = build::DEFAULT_DOCS_PER_SEGMENT)]
+    docs_per_segment: usize,
+
+    /// Suppress progress output.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SearchArgs {
+    /// The query. Supports "quoted phrases", -exclusion and site:host.
+    ///
+    /// `allow_hyphen_values` is what makes `-exclusion` work: without it the
+    /// argument parser takes `-barley` for an unknown flag and refuses the
+    /// query, which would quietly break one of the four operators the brief
+    /// asks for.
+    #[arg(value_name = "QUERY", num_args = 1.., required = true, allow_hyphen_values = true)]
+    query: Vec<String>,
+
+    /// Directory holding the index.
+    #[arg(short, long, value_name = "DIR", default_value = "data/index")]
+    index: PathBuf,
+
+    /// Directory holding the crawl store, for titles and snippets.
+    #[arg(short, long, value_name = "DIR", default_value = "data/crawl")]
+    crawl: PathBuf,
+
+    /// Results to show. Ten, because that is the product.
+    #[arg(short = 'n', long, default_value_t = 10)]
+    limit: usize,
+
+    /// Show the full per-signal score breakdown for every result.
+    #[arg(short, long)]
+    explain: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -74,14 +130,191 @@ struct CrawlArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Crawl(args) => match run_crawl(args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("uruk: {message}");
-                ExitCode::FAILURE
-            }
-        },
+        Command::Crawl(args) => finish(run_crawl(args)),
+        Command::Index(args) => finish(run_index(&args)),
+        Command::Search(args) => finish(run_search(&args)),
     }
+}
+
+fn finish(outcome: Result<(), String>) -> ExitCode {
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("uruk: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_index(args: &IndexArgs) -> Result<(), String> {
+    let manifest = build::build(&IndexConfig {
+        crawl_dir: args.crawl.clone(),
+        out_dir: args.out.clone(),
+        docs_per_segment: args.docs_per_segment.max(1),
+        progress: !args.quiet,
+    })
+    .map_err(|error| format!("indexing failed: {error}"))?;
+
+    println!("\nindex built");
+    println!("  documents          {}", manifest.documents);
+    println!("  segments           {}", manifest.segments.len());
+    println!("  distinct terms     {}", manifest.terms);
+    println!("  postings           {}", manifest.postings);
+    if manifest.skipped_empty > 0 {
+        println!("  skipped (no text)  {}", manifest.skipped_empty);
+    }
+
+    println!(
+        "\n  text indexed       {}",
+        human_bytes(manifest.text_bytes)
+    );
+    println!("  index on disk      {}", human_bytes(manifest.bytes_total));
+    println!(
+        "    postings         {}",
+        human_bytes(manifest.bytes_postings)
+    );
+    println!(
+        "    dictionary       {}",
+        human_bytes(manifest.bytes_dictionary)
+    );
+    println!("    hosts            {}", human_bytes(manifest.bytes_hosts));
+    println!(
+        "    doc table        {}",
+        human_bytes(manifest.bytes_doc_table)
+    );
+
+    // The number RESEARCH.md section 6 argues about, measured rather than
+    // estimated. The brief hoped for 15-25% of the text.
+    if manifest.text_bytes > 0 {
+        println!(
+            "\n  index is {:.0}% of the text it describes",
+            manifest.size_ratio() * 100.0
+        );
+        if manifest.documents > 0 {
+            println!(
+                "  {} per indexed page",
+                human_bytes(manifest.bytes_total / u64::from(manifest.documents))
+            );
+        }
+    }
+    println!("\nwritten to {}", args.out.display());
+    Ok(())
+}
+
+fn run_search(args: &SearchArgs) -> Result<(), String> {
+    let raw = args.query.join(" ");
+    let query = parse::parse(&raw);
+    if query.is_empty() {
+        return Err(format!("nothing to search for in {raw:?}"));
+    }
+
+    let mut index = Index::open(&args.index).map_err(|error| {
+        format!(
+            "could not open the index at {}: {error}",
+            args.index.display()
+        )
+    })?;
+    let options = SearchOptions {
+        limit: args.limit.max(1),
+        ..SearchOptions::default()
+    };
+    let results = search::search(&mut index, &query, &options)
+        .map_err(|error| format!("search failed: {error}"))?;
+
+    let mut store = StoreReader::open(&args.crawl).map_err(|error| {
+        format!(
+            "could not open the crawl store at {}: {error}",
+            args.crawl.display()
+        )
+    })?;
+
+    if results.hits.is_empty() {
+        println!("no results for {raw:?}");
+        report_cost(&results, index.len());
+        return Ok(());
+    }
+
+    let terms = query.distinct_terms();
+    for (rank, hit) in results.hits.iter().enumerate() {
+        let record = store
+            .get(hit.crawl_doc)
+            .map_err(|error| format!("could not read document {}: {error}", hit.crawl_doc))?;
+
+        let title = if record.title.trim().is_empty() {
+            &record.url
+        } else {
+            &record.title
+        };
+        println!("\n{:>2}. {title}", rank + 1);
+        println!("    {}", record.url);
+
+        let extract = snippet::snippet(
+            &record.text,
+            &terms,
+            SnippetPolicy {
+                allowed: record.snippet_allowed,
+                max_chars: record.max_snippet,
+            },
+            snippet::DEFAULT_LENGTH,
+        );
+        if !extract.is_empty() {
+            println!("    {}", extract.text.replace('\n', " "));
+        }
+
+        // Every result can say why it ranked where it did. Not a debug mode:
+        // tuning ranking from feedback is guesswork without it.
+        let parts: Vec<String> = hit
+            .explanation
+            .signals()
+            .iter()
+            .map(|(name, value)| format!("{name} {value:.3}"))
+            .collect();
+        println!("    score {:.3}  ({})", hit.score, parts.join(" + "));
+
+        if args.explain {
+            explain(hit);
+        }
+    }
+
+    report_cost(&results, index.len());
+    Ok(())
+}
+
+/// The full per-term breakdown, for tuning.
+fn explain(hit: &search::Hit) {
+    for term in &hit.explanation.terms {
+        let fields: Vec<String> = uruk_index::fields::Field::ALL
+            .iter()
+            .filter(|field| term.counts.get(**field) > 0)
+            .map(|field| format!("{}={}", field.name(), term.counts.get(*field)))
+            .collect();
+        println!(
+            "      {:<16} idf {:.3}  tf' {:.3}  ->  {:.3}   [{}]  in {} docs",
+            term.term,
+            term.idf,
+            term.pseudo_frequency,
+            term.contribution,
+            fields.join(" "),
+            term.doc_frequency,
+        );
+    }
+    if let Some(span) = hit.explanation.closest_span {
+        println!("      {:<16} terms came within {span} tokens", "proximity");
+    }
+    let quality = &hit.explanation.quality;
+    println!(
+        "      {:<16} text {:.2}  links {:.2}  scripts {}  ->  factor {:.2}",
+        "quality", quality.text_ratio, quality.link_density, quality.scripts, quality.factor
+    );
+}
+
+fn report_cost(results: &search::Results, corpus: u32) {
+    println!(
+        "\n{} of {corpus} documents matched; {} posting lists read in {:.1}ms",
+        results.matched,
+        results.lists_read,
+        results.elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 /// Read a seed file: one URL per line, `#` comments and blank lines ignored.
@@ -232,7 +465,9 @@ mod tests {
     #[test]
     fn crawl_parses_with_only_a_seed_file() {
         let cli = Cli::parse_from(["uruk", "crawl", "--seeds", "seeds.txt"]);
-        let super::Command::Crawl(args) = cli.command;
+        let super::Command::Crawl(args) = cli.command else {
+            panic!("expected crawl")
+        };
         assert_eq!(args.seeds.to_str(), Some("seeds.txt"));
         assert_eq!(args.max_pages, 1_000);
         assert!(
@@ -274,6 +509,58 @@ mod tests {
         let path = write("# nothing but comments\n", "empty");
         assert!(read_seeds(&path).unwrap_err().contains("no seed URLs"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn every_subcommand_parses() {
+        for argv in [
+            vec!["uruk", "index"],
+            vec!["uruk", "index", "--crawl", "c", "--out", "i"],
+            vec!["uruk", "search", "clay", "tablets"],
+            vec!["uruk", "search", "--explain", "-n", "3", "clay"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "failed to parse {argv:?}"
+            );
+        }
+        // A search with no query is a usage error, not an empty search.
+        assert!(Cli::try_parse_from(["uruk", "search"]).is_err());
+    }
+
+    #[test]
+    fn an_exclusion_is_a_query_term_not_an_unknown_flag() {
+        // Without allow_hyphen_values, clap rejects this outright.
+        let cli = Cli::parse_from(["uruk", "search", "clay", "-barley"]);
+        let super::Command::Search(args) = cli.command else {
+            panic!("expected search")
+        };
+        assert_eq!(args.query, ["clay", "-barley"]);
+
+        let parsed = super::parse::parse(&args.query.join(" "));
+        assert_eq!(parsed.required, ["clay"]);
+        assert_eq!(parsed.excluded, ["barley"]);
+    }
+
+    #[test]
+    fn real_flags_still_work_alongside_a_query() {
+        let cli = Cli::parse_from(["uruk", "search", "-n", "3", "--explain", "clay"]);
+        let super::Command::Search(args) = cli.command else {
+            panic!("expected search")
+        };
+        assert_eq!(args.limit, 3);
+        assert!(args.explain);
+        assert_eq!(args.query, ["clay"]);
+    }
+
+    #[test]
+    fn a_multi_word_search_query_is_joined() {
+        let cli = Cli::parse_from(["uruk", "search", "clay", "tablets"]);
+        let super::Command::Search(args) = cli.command else {
+            panic!("expected search")
+        };
+        assert_eq!(args.query.join(" "), "clay tablets");
+        assert_eq!(args.limit, 10, "ten results is the product");
     }
 
     #[test]

@@ -1,0 +1,26 @@
+[package]
+name = "uruk-query"
+description = "Uruk's query engine: matches, ranks, and explains why."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# Justifications:
+#   uruk-index - the index this searches
+#   uruk-crawl - the crawl store, for snippets and titles at result time
+#   thiserror  - typed errors
+#
+# No scoring or ranking dependency, deliberately. BM25 is about fifteen lines
+# of arithmetic and the brief requires a per-signal breakdown for every result,
+# which means we have to own the scorer rather than call into one.
+[dependencies]
+uruk-index = { path = "../uruk-index" }
+uruk-crawl = { path = "../uruk-crawl" }
+thiserror = "2"
+
+[lints]
+workspace = true
