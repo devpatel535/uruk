@@ -652,6 +652,74 @@ the field counts sitting next to it. Removing it took the index from 57.3% to
 48.9% of the text, which is a good illustration of how much a byte per posting
 is worth at this scale.
 
+### Phase 5 measured: the codecs, and a surprise
+
+`cargo run --release --example codec_bench -p uruk-index` implements
+variable-byte, Simple-9, frame-of-reference bit-packing and `PForDelta`, and
+measures size and decode speed on gap distributions with the shape real
+posting lists have. The brief asked for the trade-off rather than a
+conclusion, so here it is.
+
+**Document-id gaps** (4.4 million values, Zipf-weighted posting lists):
+
+| codec | bits/value | decode Mvals/s | size vs varint |
+|---|---|---|---|
+| variable-byte | 11.26 | 195 | 100% |
+| Simple-9 | 10.36 | 261 | 92% |
+| bit-packed (FOR) | 9.62 | 268 | **85%** |
+| `PForDelta` | 9.37 | 253 | **83%** |
+
+**Position gaps within documents** (short lists, which is what the index
+actually stores per posting):
+
+| codec | bits/value | decode Mvals/s | size vs varint |
+|---|---|---|---|
+| variable-byte | 13.68 | 50 | 100% |
+| Simple-9 | 27.31 | 49 | **200%** |
+| bit-packed (FOR) | 13.60 | 47 | 99% |
+| `PForDelta` | 13.59 | 46 | 99% |
+
+Four things worth taking from that, two of which I did not expect.
+
+**Block codecs are faster, not just smaller.** On long lists they decode about
+35% quicker than variable-byte, because there is no branch per value. The
+usual framing of compression as a size-for-speed trade is backwards here.
+
+**`PForDelta`'s patching earns much less than its reputation suggests** — 83%
+against bit-packing's 85%. Patching exists to stop one outlier widening a
+whole block, and it does: a synthetic block of small gaps with one large one
+is less than half the size under `PForDelta`, and there is a test for exactly
+that. But gaps drawn from a geometric distribution are *all* variable, so
+there is no tidy 10% of outliers to patch — the width has to rise for the bulk
+of the block regardless.
+
+**Simple-9 is actively harmful on short lists.** A list of one value costs a
+whole 32-bit word. Most terms appear once in most documents, so most position
+lists are one or two values long, and Simple-9 doubles them.
+
+**The largest finding is that the codec is not the lever.** Block schemes give
+essentially nothing on positions — not because they encode badly, but because
+the lists are too short for a block ever to fill, so everything falls through
+to the variable-byte tail. And the gains they do give apply only to the gap
+bytes, which are roughly half of the 5.72 bytes a posting costs. Switching
+every codec to the best available would take the index from 49% of text to
+around 44%.
+
+What would actually move it are two structural changes, neither of which is a
+codec:
+
+1. **Store each term's positions as one stream across all its documents**,
+   the way Lucene's separate positions file does, rather than as a short list
+   per posting. Then the blocks fill, and the 15% that block encoding cannot
+   currently reach on positions becomes available.
+2. **Get the fixed per-posting bytes down.** The field mask and count are two
+   bytes on every posting before any gap is written, and at ~515 postings per
+   document that is over a kilobyte a page spent on bookkeeping.
+
+So Phase 5's answer is: adopt `PForDelta` for document ids, keep
+variable-byte for anything short, and do not expect the codec choice alone to
+change the headline number. The restructuring is where the index gets small.
+
 ### What this means for Phase 5
 
 The measurement points straight at the work. Variable-byte is a per-value
@@ -663,9 +731,10 @@ and hoist the field mask out of the per-posting path. Positions of ~800 need
 ten bits, not sixteen.
 
 That is precisely the Phase 5 work the brief asks for, and the harness to
-measure it now exists: `examples/index_size.rs` prints the postings line that
-Simple-9, `PForDelta` and Elias-Fano have to beat. **5.72 bytes per posting is
-the number to improve on.**
+measure it now exists: `examples/index_size.rs` prints the postings line, and
+`examples/codec_bench.rs` compares the codecs directly. **5.72 bytes per
+posting is the number to improve on** — and the section below reports what the
+codecs actually did about it, which is less than the textbooks imply.
 
 ### Scaling, and the brief's target
 

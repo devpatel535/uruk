@@ -6,6 +6,7 @@
 //! reading every document.
 
 pub mod build;
+pub mod codec;
 pub mod fields;
 pub mod index;
 pub mod postings;

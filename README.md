@@ -29,7 +29,7 @@ What is built, against the brief's order of work:
 | 2. Crawler: fetch, parse, store politely | done |
 | 3. Indexer: inverted index in `.uruk` segments | done |
 | 4. Query engine: BM25F, phrases, a CLI | done |
-| 5. Compression, benchmarked against alternatives | next — baseline measured at **5.72 bytes per posting** |
+| 5. Compression, benchmarked against alternatives | codecs written and measured; see [the numbers](RESEARCH.md#phase-5-measured-the-codecs-and-a-surprise). Not yet wired into the segment format |
 | 6. Link graph and authority scoring | not started |
 | 7. Web front end | done |
 | 8. Privacy hardening and self-host packaging | partly — headers and policy done, packaging not |
@@ -102,7 +102,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 311 tests
+cargo test --workspace          # 325 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -110,7 +110,8 @@ cargo fmt --all --check
 Measuring what the index costs, on a corpus large enough to mean something:
 
 ```sh
-cargo run --release --example index_size -p uruk-index -- 100000
+cargo run --release --example index_size  -p uruk-index -- 100000
+cargo run --release --example codec_bench -p uruk-index
 ```
 
 ## Licence
