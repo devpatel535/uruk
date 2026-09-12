@@ -1,0 +1,76 @@
+# An example judged query set, and a template for a real one.
+#
+# This file is a FORMAT DEMONSTRATION, not a usable judged set. The URLs are
+# invented. A real one can only be written against a real corpus by a person
+# who looks at the pages, which is the part of this engine that cannot be
+# automated -- see RESEARCH.md 5.4, which argues that is the product rather
+# than a limitation.
+#
+#
+# HOW TO WRITE A REAL ONE
+#
+# 1. Crawl and index the corpus first. Judgments are matched by URL, so they
+#    only mean anything against pages that exist.
+#
+# 2. Pick queries the way your users would, not the way you would. Include:
+#      - the obvious ones for your subject area
+#      - two-word queries, which are most of what people type
+#      - at least a few quoted phrases and site: queries, since the engine
+#        promises those work and nothing else tests that they rank well
+#      - some queries you expect to be handled badly, or the set only ever
+#        tells you what you already believe
+#
+# 3. For each query, run it, look at the top ten, and grade them. Then look
+#    at pages you know are good that DIDN'T come back, and grade those too --
+#    otherwise recall is unmeasurable and the set rewards a ranker that is
+#    merely confident.
+#
+# 4. Fifty queries with ten judgments each is enough to catch regressions.
+#    Under twenty, `uruk eval` will tell you the comparison is a smoke test,
+#    because it is.
+#
+# 5. Re-judge after a recrawl. Coverage falling is the signal that the corpus
+#    has moved on; `uruk eval` prints it on every run and warns under 50%.
+#
+#
+# GRADES
+#
+#   3  What the searcher wanted. They would stop here.
+#   2  Genuinely useful and on-topic, but not the thing itself.
+#   1  Related. A reasonable tenth result.
+#   0  Not relevant, or actively bad: spam, a stub, an unrelated page.
+#
+# Judge the PAGE against the QUERY, not the site against your opinion of it.
+# A great site with a page that does not answer this query is a 1.
+
+
+query: clay tablets
+  3  https://example.org/mesopotamia/cuneiform-tablets
+  2  https://example.org/mesopotamia/writing
+  1  https://example.net/ancient-near-east
+  0  https://shop.example.com/clay-tablet-replica
+
+query: "barley rations"
+  3  https://example.org/mesopotamia/temple-accounts
+  1  https://example.org/mesopotamia/cuneiform-tablets
+  0  https://example.net/barley-recipes
+
+# A query the engine is expected to struggle with: two common words, no
+# distinctive term. Keeping deliberately hard queries in the set is what stops
+# it drifting into a set of things that already work.
+query: early writing
+  3  https://example.org/mesopotamia/writing
+  2  https://example.edu/history-of-script
+  0  https://blog.example.com/my-handwriting
+
+# A site: query, because the engine promises the operator works and nothing
+# else checks that it also ranks sensibly.
+query: site:example.org tablets
+  3  https://example.org/mesopotamia/cuneiform-tablets
+  2  https://example.org/mesopotamia/temple-accounts
+
+# A query with no good answer in the corpus. These are worth judging: a
+# ranker that returns confident nonsense for them is worse than one that
+# returns little, and only an explicit set of zeros can show that.
+query: quantum chromodynamics
+  0  https://example.org/mesopotamia/writing

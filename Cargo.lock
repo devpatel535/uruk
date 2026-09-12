@@ -1736,6 +1736,7 @@ dependencies = [
  "tokio",
  "url",
  "uruk-crawl",
+ "uruk-eval",
  "uruk-index",
  "uruk-link",
  "uruk-query",
@@ -1756,6 +1757,17 @@ dependencies = [
  "tokio",
  "url",
  "zstd",
+]
+
+[[package]]
+name = "uruk-eval"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+ "uruk-crawl",
+ "uruk-index",
+ "uruk-link",
+ "uruk-query",
 ]
 
 [[package]]

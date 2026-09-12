@@ -12,6 +12,10 @@ use url::Url;
 use uruk_crawl::crawler::{self, CrawlConfig, DEFAULT_USER_AGENT};
 use uruk_crawl::store::{CrawlSummary, StoreReader};
 use uruk_crawl::traps::Limits;
+use uruk_eval::compare::{self, Comparison};
+use uruk_eval::judgments::Judgments;
+use uruk_eval::metrics::{self, Summary};
+use uruk_eval::run::{Configuration, Signal, evaluate};
 use uruk_index::build::{self, IndexConfig};
 use uruk_index::index::Index;
 use uruk_link::authority::{self, Authority, Method, rank_correlation};
@@ -38,10 +42,65 @@ enum Command {
     Index(IndexArgs),
     /// Build the host link graph and score every host's authority.
     Link(LinkArgs),
+    /// Score a ranking configuration against a judged query set.
+    Eval(EvalArgs),
     /// Search an index.
     Search(SearchArgs),
     /// Serve the web front end.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct EvalArgs {
+    /// The judged query set. See `crates/uruk-eval/src/judgments.rs` for the
+    /// format; it is plain text and meant to be edited by hand.
+    #[arg(short, long, value_name = "FILE")]
+    judgments: PathBuf,
+
+    /// Directory holding the index.
+    #[arg(short, long, value_name = "DIR", default_value = "data/index")]
+    index: PathBuf,
+
+    /// Directory holding the crawl store. Judgments are matched by URL, which
+    /// lives in the crawl store rather than the index.
+    #[arg(short, long, value_name = "DIR", default_value = "data/crawl")]
+    crawl: PathBuf,
+
+    /// Results to score per query. Ten, because that is the product: a
+    /// brilliant result at position eleven did not help anybody.
+    #[arg(short = 'n', long, default_value_t = metrics::DEFAULT_DEPTH)]
+    depth: usize,
+
+    /// Also run the engine with this signal switched off, and report whether
+    /// the difference is detectable. Repeatable.
+    #[arg(long = "without", value_enum)]
+    without: Vec<SignalArg>,
+
+    /// Also compare the two authority methods against each other.
+    #[arg(long)]
+    compare_authority: bool,
+
+    /// Show the per-query scores, worst first. For finding the queries a
+    /// change actually broke.
+    #[arg(short, long)]
+    per_query: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SignalArg {
+    Authority,
+    Proximity,
+    Quality,
+}
+
+impl From<SignalArg> for Signal {
+    fn from(value: SignalArg) -> Self {
+        match value {
+            SignalArg::Authority => Self::Authority,
+            SignalArg::Proximity => Self::Proximity,
+            SignalArg::Quality => Self::Quality,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -215,6 +274,7 @@ fn main() -> ExitCode {
         Command::Crawl(args) => finish(run_crawl(args)),
         Command::Index(args) => finish(run_index(&args)),
         Command::Link(args) => finish(run_link(&args)),
+        Command::Eval(args) => finish(run_eval(&args)),
         Command::Search(args) => finish(run_search(&args)),
         Command::Serve(args) => finish(run_serve(&args)),
     }
@@ -305,6 +365,136 @@ fn run_index(args: &IndexArgs) -> Result<(), String> {
     }
     println!("\nwritten to {}", args.out.display());
     Ok(())
+}
+
+/// Score a ranking configuration against a judged query set.
+///
+/// The point of this command is that it makes a ranking argument settleable.
+/// Every weight in the scorer is currently a starting value chosen by reading,
+/// not by measurement, and `RESEARCH.md` §5.4 says plainly that tuning them by
+/// eye is guessing. This is how the guessing stops.
+fn run_eval(args: &EvalArgs) -> Result<(), String> {
+    let judgments = Judgments::load(&args.judgments)
+        .map_err(|error| format!("could not read the judged query set: {error}"))?;
+    if judgments.is_empty() {
+        return Err(format!("{} contains no queries", args.judgments.display()));
+    }
+
+    let mut index = Index::open(&args.index).map_err(|error| {
+        format!(
+            "could not open the index at {}: {error}",
+            args.index.display()
+        )
+    })?;
+    let mut store = StoreReader::open(&args.crawl).map_err(|error| {
+        format!(
+            "could not open the crawl store at {}: {error}",
+            args.crawl.display()
+        )
+    })?;
+    let authority = Authority::beside_crawl(&args.crawl)
+        .map_err(|error| format!("could not read the authority table: {error}"))?;
+
+    let mut baseline = Configuration::baseline(authority.clone());
+    baseline.depth = args.depth.max(1);
+
+    let run = evaluate(&mut index, &mut store, &judgments, &baseline)
+        .map_err(|error| format!("evaluation failed: {error}"))?;
+
+    println!();
+    println!("  judged queries     {}", judgments.len());
+    println!("  graded documents   {}", judgments.graded());
+    println!("  evaluation depth   {}", baseline.depth);
+    report_summary("baseline", &run.summary);
+
+    if authority.is_none() {
+        println!(
+            "\n  note: no authority table beside the crawl, so this is text-only ranking.\n\
+             \x20       run `uruk link` first to include host authority."
+        );
+    }
+
+    if args.per_query {
+        report_per_query(&judgments, &run.scores);
+    }
+
+    // Each variant is the same engine with one thing changed, which is the
+    // only kind of comparison that can attribute a difference to a cause.
+    for signal in &args.without {
+        let variant = baseline.without((*signal).into());
+        let other = evaluate(&mut index, &mut store, &judgments, &variant)
+            .map_err(|error| format!("evaluation failed: {error}"))?;
+        report_comparison(&variant.name, &run.scores, &other.scores);
+    }
+
+    if args.compare_authority {
+        if authority.is_none() {
+            println!("\n  cannot compare authority methods: no authority table");
+        } else {
+            let degree = baseline.using(Method::InDegree);
+            let trust = baseline.using(Method::TrustRank);
+            let a = evaluate(&mut index, &mut store, &judgments, &degree)
+                .map_err(|error| format!("evaluation failed: {error}"))?;
+            let b = evaluate(&mut index, &mut store, &judgments, &trust)
+                .map_err(|error| format!("evaluation failed: {error}"))?;
+            report_comparison("trustrank instead of in-degree", &a.scores, &b.scores);
+        }
+    }
+
+    Ok(())
+}
+
+fn report_summary(name: &str, summary: &Summary) {
+    println!("\n  {name}");
+    println!("    nDCG@10          {:.4}", summary.ndcg);
+    println!("    precision        {:.4}", summary.precision);
+    println!("    MRR              {:.4}", summary.mean_reciprocal_rank);
+    println!("    recall           {:.4}", summary.recall);
+    println!("    judged coverage  {:.4}", summary.coverage);
+    if summary.empty > 0 {
+        println!(
+            "    {} queries returned nothing: the corpus, not the ranking, is what is short",
+            summary.empty
+        );
+    }
+    // Coverage is the number that decides whether any of the above is
+    // evidence. Below half, most of what the engine returned was scored as
+    // irrelevant only because nobody had looked at it.
+    if summary.coverage < 0.5 {
+        println!(
+            "    WARNING: under half of the returned results were judged at all.\n\
+             \x20            These scores mostly measure how much of the corpus the\n\
+             \x20            judge has seen, not how good the ranking is."
+        );
+    }
+}
+
+fn report_per_query(judgments: &Judgments, scores: &[uruk_eval::Scored]) {
+    let mut rows: Vec<(&str, &uruk_eval::Scored)> = judgments
+        .queries
+        .iter()
+        .map(|judged| judged.query.as_str())
+        .zip(scores)
+        .collect();
+    rows.sort_by(|a, b| a.1.ndcg.total_cmp(&b.1.ndcg));
+
+    println!("\n  per query, worst first");
+    for (query, scored) in rows {
+        println!(
+            "    {:.4}  cov {:.2}  {}",
+            scored.ndcg, scored.coverage, query
+        );
+    }
+}
+
+fn report_comparison(name: &str, baseline: &[uruk_eval::Scored], variant: &[uruk_eval::Scored]) {
+    let result: Comparison = compare::compare(baseline, variant, compare::DEFAULT_TRIALS);
+    println!("\n  {name}");
+    println!(
+        "    nDCG {:.4} -> {:.4}  ({:+.4})",
+        result.baseline, result.variant, result.difference
+    );
+    println!("    {}", result.verdict());
 }
 
 /// Build the host link graph and write the authority table.

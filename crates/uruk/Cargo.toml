@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 # Justifications:
 #   uruk-crawl - the crawler this binary drives
+#   uruk-eval  - the judged-query harness behind `uruk eval`
 #   uruk-index - the indexer
 #   uruk-link  - the link graph and host authority
 #   uruk-query - the query engine
@@ -26,6 +27,7 @@ path = "src/main.rs"
 #   url        - seed parsing, so a bad seed is reported before the crawl starts
 [dependencies]
 uruk-crawl = { path = "../uruk-crawl" }
+uruk-eval = { path = "../uruk-eval" }
 uruk-index = { path = "../uruk-index" }
 uruk-link = { path = "../uruk-link" }
 uruk-query = { path = "../uruk-query" }

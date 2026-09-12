@@ -565,6 +565,96 @@ ranker without one, and every hour spent tuning by eye before it exists is an
 hour spent guessing. It doesn't need to be big — 50 queries with 10 judged
 results each is enough to catch regressions, and it can grow.
 
+
+#### What Phase 9 built, and the one thing it refuses to do
+
+> **Updated after building it.** The harness now exists, in `uruk-eval` and
+> behind `uruk eval`. It was built out of order, ahead of the brief's Phase 7
+> and after §5.3 and §6 had both deferred a decision to "the judged set that
+> does not exist yet" — which is exactly the trap this section warned about.
+
+```sh
+uruk eval --judgments queries.txt --without authority --compare-authority
+```
+
+Four parts:
+
+**The judged set** is plain text, because a person writes it and a diff of it
+has to be readable:
+
+```text
+query: clay tablets
+  3  https://example.org/mesopotamia/cuneiform-tablets
+  2  https://example.org/mesopotamia/writing
+  0  https://shop.example.com/clay-tablet-replica
+```
+
+Grades are 0–3, the query line goes through the ordinary parser so phrases,
+exclusions and `site:` can all be judged, and duplicate query blocks are a
+parse error rather than a silent merge — two people judging the same query in
+one file should find out.
+
+**The metrics** are nDCG@10, precision, MRR and recall. Gain is `2^grade − 1`
+and the discount is `1/log2(rank+1)`, so one excellent result outweighs three
+mediocre ones, which is how a person actually reads a results page.
+
+**The coverage number** is the one that matters and the one most harnesses
+leave out. A result the judge never saw is not bad — nobody looked. There are
+only two honest ways to handle it: score it zero (which punishes a ranker for
+surfacing anything new) or drop it (which rewards a ranker for returning
+nothing judged). There is no third option that is not a guess, so this scores
+it zero and **prints the unjudged rate on every run**, with a warning under
+50%:
+
+```text
+    judged coverage  0.68
+```
+
+Below half, the score is mostly a measurement of how much of the corpus the
+judge has seen.
+
+**The significance test** is a paired randomisation test. Both configurations
+run over the same queries; under the null hypothesis the two numbers in each
+pair are interchangeable, so flip a coin per query ten thousand times and count
+how often a shuffled mean beats the observed one. Smucker, Allan and Carterette
+(2007) compared randomisation against the t-test, sign, Wilcoxon and bootstrap
+tests on TREC data; randomisation and the bootstrap agreed and the rank-based
+tests did not. It also assumes nothing about how nDCG is distributed, which is
+the honest position, since nobody knows.
+
+**The thing it refuses to do is call a small difference a win.** Run against
+the Phase 6 fixture — five queries, a real index, a real link farm:
+
+```text
+  baseline
+    nDCG@10          0.9337
+    judged coverage  0.6800
+
+  no authority
+    nDCG 0.9337 -> 0.7900  (-0.1437)
+    5 queries is too few to conclude anything; treat this as a smoke test
+```
+
+Fourteen nDCG points is a large difference and the harness still declines to
+draw a conclusion from five queries. That refusal is the feature. A harness
+that produced a confident number there would be worse than no harness, because
+every subsequent ranking change would arrive with a p-value attached and none
+of them would mean anything.
+
+**What is now answerable that was not.** Every weight in the scorer is marked
+"starting value, not tuned", and §5.3's in-degree versus TrustRank question has
+been deferred twice. All of them are now one command away from an answer —
+`--without authority`, `--without proximity`, `--without quality`,
+`--compare-authority` — for anyone with a real corpus and a real judged set.
+
+**What this cannot do, and nothing can.** It cannot write the judgments.
+Deciding what a good answer looks like is a human judgement about a specific
+corpus. `crates/uruk-eval/examples/judgments.example.txt` is a template with
+the process, including the parts that are easy to get wrong: judging pages that
+did *not* come back, so recall is measurable; keeping deliberately hard queries
+in the set, so it does not drift into a list of things that already work; and
+re-judging after a recrawl, which falling coverage is the signal for.
+
 ### 5.5 "Decompressed per query, memory released when the query finishes"
 
 The rule in Section 7 is directionally right and, taken literally, would make

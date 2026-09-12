@@ -1,0 +1,30 @@
+[package]
+name = "uruk-eval"
+description = "Uruk's ranking evaluation: judged queries, nDCG, and whether a change actually helped."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# Justifications:
+#   uruk-index / uruk-query / uruk-link / uruk-crawl - runs real searches
+#                against a real index, because a harness that evaluates a mock
+#                is evaluating the mock
+#   thiserror  - typed errors
+#
+# Note what is absent: no statistics crate. The one test here that needs to be
+# right is a paired randomisation test, which is a loop and a counter. Reading
+# it should be enough to trust it, and that is not true of a call into a
+# library whose assumptions we have not checked.
+[dependencies]
+uruk-crawl = { path = "../uruk-crawl" }
+uruk-index = { path = "../uruk-index" }
+uruk-link = { path = "../uruk-link" }
+uruk-query = { path = "../uruk-query" }
+thiserror = "2"
+
+[lints]
+workspace = true
