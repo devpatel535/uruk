@@ -1,0 +1,36 @@
+[package]
+name = "uruk-serve"
+description = "Uruk's web front end: a search box and a list of links."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# Justifications:
+#   uruk-query / uruk-index / uruk-crawl - the engine this puts a face on
+#   axum + tokio - the HTTP layer. Hand-rolling HTTP for something facing the
+#                  public internet is a security liability, and axum is a thin
+#                  layer over hyper, which is the battle-tested part. It brings
+#                  no client-side anything: the pages it serves are HTML and
+#                  CSS, and nothing is fetched from a third party.
+#
+# Note what is absent: no templating engine. The pages are two screens of HTML
+# and the escaping has to be ours anyway, since a search box that reflects its
+# input is the classic place to get cross-site scripting wrong.
+[dependencies]
+uruk-crawl = { path = "../uruk-crawl" }
+uruk-index = { path = "../uruk-index" }
+uruk-query = { path = "../uruk-query" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+
+[lints]
+workspace = true

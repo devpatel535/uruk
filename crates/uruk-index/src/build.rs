@@ -30,7 +30,8 @@ pub const DEFAULT_DOCS_PER_SEGMENT: usize = 50_000;
 pub enum IndexError {
     #[error("could not read the crawl store: {0}")]
     Store(#[from] StoreError),
-    #[error("could not write the segment: {0}")]
+    // Covers reading as well as writing, so the wording stays neutral.
+    #[error("segment: {0}")]
     Segment(#[from] SegmentError),
     #[error("index I/O failed: {0}")]
     Io(#[from] std::io::Error),

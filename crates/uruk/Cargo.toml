@@ -17,6 +17,7 @@ path = "src/main.rs"
 #   uruk-crawl - the crawler this binary drives
 #   uruk-index - the indexer
 #   uruk-query - the query engine
+#   uruk-serve - the web front end
 #   clap       - argument parsing. Hand-rolling it was the alternative; clap
 #                earns its place because the CLI grows a subcommand per phase
 #                and its generated --help is the operator's documentation.
@@ -26,6 +27,7 @@ path = "src/main.rs"
 uruk-crawl = { path = "../uruk-crawl" }
 uruk-index = { path = "../uruk-index" }
 uruk-query = { path = "../uruk-query" }
+uruk-serve = { path = "../uruk-serve" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 url = "2"

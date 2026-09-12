@@ -1,7 +1,6 @@
 //! `uruk` — the command-line entry point.
 //!
-//! One subcommand per component, added as each phase is built. `crawl`,
-//! `index` and `search` are here; `serve` follows.
+//! One subcommand per component: `crawl`, `index`, `search` and `serve`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,6 +17,7 @@ use uruk_index::index::Index;
 use uruk_query::parse;
 use uruk_query::search::{self, SearchOptions};
 use uruk_query::snippet::{self, SnippetPolicy};
+use uruk_serve::server::{self, ServeConfig};
 
 const TAGLINE: &str = "A search engine that returns links, not answers.";
 
@@ -36,6 +36,33 @@ enum Command {
     Index(IndexArgs),
     /// Search an index.
     Search(SearchArgs),
+    /// Serve the web front end.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    /// Directory holding the index.
+    #[arg(short, long, value_name = "DIR", default_value = "data/index")]
+    index: PathBuf,
+
+    /// Directory holding the crawl store, for titles and snippets.
+    #[arg(short, long, value_name = "DIR", default_value = "data/crawl")]
+    crawl: PathBuf,
+
+    /// Address to listen on. Loopback by default: putting a search engine on
+    /// a public address should be a decision, not an accident.
+    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    address: String,
+
+    /// Results per page.
+    #[arg(short = 'n', long, default_value_t = 10)]
+    limit: usize,
+
+    /// Show each result's score breakdown on the page. For tuning; off by
+    /// default, because the product is ten links and nothing else.
+    #[arg(short, long)]
+    explain: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -133,7 +160,30 @@ fn main() -> ExitCode {
         Command::Crawl(args) => finish(run_crawl(args)),
         Command::Index(args) => finish(run_index(&args)),
         Command::Search(args) => finish(run_search(&args)),
+        Command::Serve(args) => finish(run_serve(&args)),
     }
+}
+
+fn run_serve(args: &ServeArgs) -> Result<(), String> {
+    let address = args
+        .address
+        .parse()
+        .map_err(|error| format!("{:?} is not an address to listen on: {error}", args.address))?;
+
+    let config = ServeConfig {
+        index_dir: args.index.clone(),
+        crawl_dir: args.crawl.clone(),
+        address,
+        results_per_page: args.limit.max(1),
+        explain: args.explain,
+        user_agent: DEFAULT_USER_AGENT.to_owned(),
+    };
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("could not start the async runtime: {error}"))?;
+    runtime
+        .block_on(server::run(&config))
+        .map_err(|error| format!("server failed: {error}"))
 }
 
 fn finish(outcome: Result<(), String>) -> ExitCode {
@@ -518,6 +568,8 @@ mod tests {
             vec!["uruk", "index", "--crawl", "c", "--out", "i"],
             vec!["uruk", "search", "clay", "tablets"],
             vec!["uruk", "search", "--explain", "-n", "3", "clay"],
+            vec!["uruk", "serve"],
+            vec!["uruk", "serve", "--address", "0.0.0.0:9000", "--explain"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_ok(),
@@ -561,6 +613,22 @@ mod tests {
         };
         assert_eq!(args.query.join(" "), "clay tablets");
         assert_eq!(args.limit, 10, "ten results is the product");
+    }
+
+    #[test]
+    fn serve_listens_on_loopback_by_default() {
+        // Putting a search engine on a public address should be a decision.
+        let cli = Cli::parse_from(["uruk", "serve"]);
+        let super::Command::Serve(args) = cli.command else {
+            panic!("expected serve")
+        };
+        assert!(
+            args.address.starts_with("127.0.0.1"),
+            "default address: {}",
+            args.address
+        );
+        assert!(!args.explain, "score breakdowns are off on the public page");
+        assert_eq!(args.limit, 10);
     }
 
     #[test]

@@ -64,7 +64,21 @@ use crate::tokenize::{self, Token};
 const FIELD_POSITION_GAP: u32 = 1_000;
 
 const MAGIC: &[u8; 8] = b"URUKIDX1";
-const FORMAT_VERSION: u32 = 1;
+
+/// On-disk format version.
+///
+/// **Bump this on every encoding change, without exception.** A segment whose
+/// bytes mean something different but whose version still matches is not
+/// rejected — it is decoded, silently, into wrong answers. That happened once
+/// during development: the host table and the position scheme both changed
+/// while this stayed at 1, and a stale index went on being read as if nothing
+/// had, returning fewer results than it should with no error anywhere.
+///
+/// History:
+/// - 1: first format.
+/// - 2: host table added; positions kept for every field rather than the body
+///   alone; the redundant per-posting position count removed.
+const FORMAT_VERSION: u32 = 2;
 /// 4 section offsets + term count + 4 corpus totals + doc count + magic.
 const FOOTER_LEN: u64 = 8 * 5 + 8 * FIELD_COUNT as u64 + 4 + 8;
 

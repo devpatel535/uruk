@@ -10,16 +10,37 @@ index. No ads, no tracking, no AI summaries.
 
 ## Status
 
-**Phase 0 — research.** This repository currently contains the scaffold, the
-licence, and [`RESEARCH.md`](RESEARCH.md). There is no engine code yet, and
-that is deliberate: the research document has to be read and argued with
-before the first component is designed.
+**It works.** You can crawl a set of sites, build an index, and search it —
+from the command line or from a web page.
 
-`RESEARCH.md` is the thing to read. It covers what search engines of the
-2003–2014 era actually did, which of their failures we are designing around,
-where each of our ideas is borrowed from, and — the part that matters most —
-the places where this project's stated plan does not survive contact with the
-2026 web.
+```sh
+uruk crawl  --seeds seeds.txt --out data/crawl --max-pages 1000
+uruk index  --crawl data/crawl --out data/index
+uruk search --index data/index --crawl data/crawl "clay tablets"
+uruk serve  --index data/index --crawl data/crawl
+```
+
+What is built, against the brief's order of work:
+
+| Step | State |
+|---|---|
+| 0. Scaffold, licence, CI | done |
+| 1. [Phase 0 research](RESEARCH.md) | done — **read this first** |
+| 2. Crawler: fetch, parse, store politely | done |
+| 3. Indexer: inverted index in `.uruk` segments | done |
+| 4. Query engine: BM25F, phrases, a CLI | done |
+| 5. Compression, benchmarked against alternatives | next — baseline measured at **5.72 bytes per posting** |
+| 6. Link graph and authority scoring | not started |
+| 7. Web front end | done |
+| 8. Privacy hardening and self-host packaging | partly — headers and policy done, packaging not |
+| 9. Scale the crawl, tune against a judged query set | blocked on choosing a subject area |
+| 10. Release quietly | not started |
+| 11. Browser | much later, as agreed |
+
+[`RESEARCH.md`](RESEARCH.md) is still the thing to read before anything else.
+It covers what engines of that era actually did, which of their failures this
+is designed around, and — the part that matters — where the brief's plan does
+not survive contact with the 2026 web.
 
 ## Principles
 
@@ -35,60 +56,61 @@ the wrong design.
    put one.
 3. **No tracking.** No identifying cookies, no accounts, no per-person search
    history, no third-party scripts, no fingerprinting analytics.
-4. **Small on disk, fast to search.** The index stays compressed at rest and
-   is decompressed per query, only for the blocks a query actually touches.
+4. **Small on disk, fast to search.** The index stays compressed at rest and is
+   read per query, only for the posting lists a query actually mentions.
 5. **Relevance beats popularity.** A page ranks because it matches the query
    and is linked to by credible pages — not because it is commercially large,
    recent, or frequently clicked.
 6. **Plain output.** HTML and CSS. No JavaScript required to see results. It
-   should work in a text browser.
+   works in a text browser.
 
-## Planned shape
+## How it fits together
 
-Component names are fixed; the components themselves are built one phase at a
-time, and no crate exists here until it has been designed.
-
-| Component | Name | What it does |
+| Component | Crate | What it does |
 |---|---|---|
-| CLI | `uruk` | One binary, one subcommand per component |
-| Crawler | `uruk-crawl` | Fetches pages politely, extracts text and links |
-| Indexer | `uruk-index` | Turns crawled text into an inverted index |
-| Query engine | `uruk-query` | Matches and ranks, with a per-signal score breakdown |
-| Web front end | `uruk-serve` | Server-rendered HTML, under 20 KB a page |
-| Index format | `.uruk` segments | Immutable, compressed, merged in the background |
+| CLI | `uruk` | One subcommand per component |
+| Crawler | `uruk-crawl` | Fetches politely, extracts text and links, stores compressed |
+| Indexer | `uruk-index` | Tokenises, builds `.uruk` segments, merges nothing yet |
+| Query engine | `uruk-query` | Matches, ranks with BM25F, explains every result |
+| Front end | `uruk-serve` | Server-rendered HTML, under 2 KB a page |
 
-## Order of work
+A crawl writes `pages.uruk` (block-compressed text) and `pages.idx`. An index
+writes one or more `segment-*.uruk` files plus a readable `index.json`.
 
-0. Scaffold — **done**
-1. Phase 0 research → `RESEARCH.md` → **here now; waiting on review**
-2. Crawler that fetches, parses and stores 1,000 pages politely
-3. Indexer that turns those into a searchable inverted index
-4. Query engine with BM25 and a command-line search interface
-5. Compression, benchmarked against alternatives
-6. Link graph and authority scoring
-7. Web front end
-8. Privacy hardening and self-host packaging
-9. Scale the crawl, tune ranking against a held-out query set
-10. Release quietly. Listen. Iterate.
-11. Browser, eventually
+### What each piece actually guarantees
+
+Claims worth being precise about, each of which has a test:
+
+- The crawler reads `robots.txt` before anything else on a host and obeys it,
+  including `Crawl-delay`, which is not in the standard. It makes at most one
+  request to a host at a time and never faster than the configured delay —
+  the end-to-end test asserts this by timing the requests a server receives.
+- It honours `noindex`, `nofollow`, `noarchive`, `nosnippet` and
+  `max-snippet`, from both meta tags and the `X-Robots-Tag` header.
+- Redirects are not followed by the HTTP client. A 3xx goes back through the
+  frontier so the target's own `robots.txt` is consulted.
+- Search is boolean AND by default. `"quoted phrases"`, `-exclusion` and
+  `site:host` all work, including phrases inside titles.
+- Every result can show its per-signal score breakdown (`uruk search
+  --explain`), and a test asserts the parts sum exactly to the score.
+- Served pages load nothing from anywhere else, set no cookies, and send no
+  referrer to the sites they link to.
 
 ## Building
 
-Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version and
-installs the components CI uses.
+Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace
-cargo clippy --workspace --all-targets   # lint set lives in the workspace manifest
+cargo test --workspace          # 311 tests
+cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
 
-The binary currently answers for itself and nothing else:
+Measuring what the index costs, on a corpus large enough to mean something:
 
 ```sh
-$ uruk version
-uruk 0.0.0
+cargo run --release --example index_size -p uruk-index -- 100000
 ```
 
 ## Licence
@@ -102,5 +124,5 @@ being run as a network service, so a company cannot take this engine, improve
 it privately, and offer a closed hosted competitor. It does not, and cannot,
 prohibit ads — that promise is kept by us, not by the licence.
 
-Note that the licence covers the software. The crawled corpus and the built
-index are separate questions, still open.
+The licence covers the software. The crawled corpus and the built index are
+separate questions, still open.
