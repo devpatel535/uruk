@@ -1137,17 +1137,37 @@ The `exact proximity` column stays, and `uruk eval` can switch between the two,
 so the day somebody has a real judged query set the cost of this approximation
 is a command rather than an argument.
 
-### The second half is not fixed, and needs a format change
+### What is left, and why it is two changes rather than one
 
-Decoding the position streams is still ~75ms of the worst case, because even to
-read one document's positions the stream must be decoded from its start: it is
-sequential by construction. The two-phase scoring above knows exactly which
-hundred documents it wants, and has no way to ask for only those.
+The remaining 91.4ms decomposes. A single 100,000-posting list reads in 23.6ms
+without positions, and this query reads two of them, so roughly **45ms is
+reading document ids and frequencies and scoring 84,234 candidates**, and the
+other **~46ms is decoding position streams**.
 
-The standard answer is **skip pointers**: group positions by blocks of
-documents and store a byte offset per block, so a reader can jump. It is what
-Lucene's skip lists are for. It is a change to the on-disk format, and it is
-not written.
+Both have known fixes, and it is worth being precise that neither is sufficient
+alone:
+
+1. **Skip pointers into the position stream.** Even to read one document's
+   positions the stream must be decoded from its start, because it is
+   sequential by construction — the two-phase scoring above knows exactly which
+   hundred documents it wants and has no way to ask for only those. Grouping
+   positions by blocks of documents with a byte offset per block is the
+   standard answer, and it is what Lucene's skip lists are for. It is a change
+   to the on-disk format. Optimistically it removes most of the 46ms.
+
+2. **Top-k pruning — block-max WAND.** That still leaves ~45ms of reading and
+   scoring every candidate, which no amount of position cleverness touches.
+   Storing a maximum score per block of postings lets the traversal skip whole
+   blocks that cannot contain a top-ten result. This is the larger lever and
+   the more intrusive change.
+
+The arithmetic, so nobody plans on the wrong one: at a million documents the
+worst case is about 900ms. Skip pointers alone would bring it to roughly 500ms.
+Both together get under 200ms. An earlier draft of this section called skip
+pointers "the single remaining fix", which was wrong in a way that would have
+sent somebody down the shorter road first.
+
+Neither is written.
 
 ### Where principle 4 actually stands
 
@@ -1155,7 +1175,7 @@ not written.
 |---|---|---|
 | Index size | "small on disk" | **met** — 29% of text with positions, 3,951 bytes per page, stable from 20k to 100k documents |
 | Latency, 100k documents | sub-200ms | **met**, worst case 98.5ms — half the budget |
-| Latency, 1M documents | sub-200ms | **not met for the worst case**, by roughly a factor of five |
+| Latency, 1M documents | sub-200ms | **not met for the worst case** — about 900ms, so roughly a factor of five |
 
 The worst case is two *very* common terms — in this corpus the rank-1 term
 appears in every document, which is what "the" does in English. The engine
@@ -1169,7 +1189,7 @@ Two honest readings, and both belong here:
 - **The budget holds today** for any corpus up to roughly 200,000 documents,
   which is more than a self-hosted topical index is likely to be.
 - **The budget does not hold at the scale the rest of the design is sized
-  for**, and the single remaining fix is named above.
+  for**, and getting there needs both of the changes named above, not one.
 
 Halving the worst case twice over — 176ms to 98.5ms, on top of 88.8ms to 23.1ms
 for the common cases — came from measuring first and changing second. The

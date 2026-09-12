@@ -148,8 +148,9 @@ every case is inside the 200ms budget with the worst at **98.5ms**, down from
 budget holds to roughly 200,000 documents and the worst case would still miss
 it at a million. [RESEARCH.md
 §6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
-has the breakdown, what was fixed, and the one remaining change — skip pointers
-into the position stream — which is not written.
+has the breakdown, what was fixed, and the two changes still needed to hold the
+budget at a million pages — skip pointers into the position stream and
+block-max WAND — neither of which is written.
 
 ## Running your own
 
