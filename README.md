@@ -34,7 +34,7 @@ What is built, against the brief's order of work:
 | 5. Compression, benchmarked against alternatives | done — index cut from 49% to 29% of the text it describes; [the numbers, and why the codec was not the lever](RESEARCH.md#6-what-small-on-disk-actually-means-in-numbers) |
 | 6. Link graph and authority scoring | done — host graph, in-degree and TrustRank; [what it measured against a link farm](RESEARCH.md#53-pagerank-on-a-small-crawl-does-almost-nothing--and-theres-evidence) |
 | 7. Web front end | done |
-| 8. Privacy hardening and self-host packaging | partly — headers and policy done, packaging not |
+| 8. Privacy hardening and self-host packaging | done — see [DEPLOYING.md](DEPLOYING.md) |
 | 9. Scale the crawl, tune against a judged query set | harness done (`uruk eval`: nDCG, coverage, a significance test); the crawl itself is blocked on choosing a subject area |
 | 10. Release quietly | not started |
 | 11. Browser | much later, as agreed |
@@ -104,6 +104,9 @@ Claims worth being precise about, each of which has a test:
   is 84% of the corpus scores that farm zero.
 - A ranking change is measured, not argued about — and `uruk eval` refuses to
   call a difference significant on too few queries, however large it is.
+- The server writes no access log and no record of any query. A test runs the
+  real binary, searches for a unique string, and fails if that string appears
+  in anything the process wrote.
 - Served pages load nothing from anywhere else, set no cookies, and send no
   referrer to the sites they link to.
 - A segment written by a different version of the format is refused by name,
@@ -117,7 +120,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 375 tests
+cargo test --workspace          # 376 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -134,6 +137,18 @@ bytes per posting, and store and index together come to **3,951 bytes per
 indexed page** — about 3.7 GB per million pages, with phrase search and
 proximity intact. Both numbers print on every run, so a change that makes the
 index fatter is visible immediately.
+
+## Running your own
+
+[`DEPLOYING.md`](DEPLOYING.md) is the operational guide: a hardened systemd
+unit, a Dockerfile, disk sizing from the measured numbers, and the refresh
+procedure.
+
+Read the first section of it before anything else. The single most likely way
+to break the privacy promise is not in this code — it is the reverse proxy in
+front of it, whose default access log records the request URI, which for this
+server is the query somebody typed. `deploy/proxy/` has configurations that do
+not.
 
 ## Licence
 

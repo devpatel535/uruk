@@ -1,0 +1,41 @@
+# Caddy in front of uruk-serve.
+#
+#   caddy run --config deploy/proxy/Caddyfile
+#
+# Caddy gets TLS right without being asked, which is most of why it is the
+# first example here. The part that needs asking is the logging.
+
+search.example.org {
+	# THE IMPORTANT LINE.
+	#
+	# Caddy's access log records the request URI. For this server the request
+	# URI is `/search?q=<what the person typed>`, so an ordinary access log
+	# is a log of everybody's searches, next to their IP address and the
+	# timestamp. Nothing in uruk's own code can prevent that: the promise on
+	# /privacy is broken here, at the proxy, by a default that is entirely
+	# reasonable for every other kind of site.
+	#
+	# So: off. If you need to know the service is up, monitor it from
+	# outside rather than by writing down what people asked it.
+	log {
+		output discard
+	}
+
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8080 {
+		# uruk-serve does not read these and must never start: a header
+		# carrying the client's IP into the application is how an IP ends up
+		# somewhere it was promised not to be.
+		header_up -X-Forwarded-For
+		header_up -X-Real-IP
+	}
+
+	# uruk-serve sets its own Content-Security-Policy, Referrer-Policy,
+	# X-Content-Type-Options and Cache-Control. HSTS is the proxy's job,
+	# because only the proxy knows whether TLS is actually terminated here.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+}

@@ -239,9 +239,15 @@ pub fn privacy() -> String {
          <p>Being honest about the limits: your browser sends this server your \
          IP address and user-agent in order to reach it at all, as it does to \
          every site. That is true of any web server and we would rather say so \
-         than imply otherwise. Whether those are written to a log depends on \
-         who is running this instance — which is why it is self-hostable, and \
-         why you can run your own.</p>\n\
+         than imply otherwise.</p>\n\
+         <p>The search software itself writes nothing down: it keeps no access \
+         log and no record of any query, and there is a test that fails if it \
+         ever starts. But almost every site sits behind a second program that \
+         handles encryption, and those normally do keep a log of every address \
+         requested — which here would mean a log of searches. Whether this \
+         instance does is up to whoever runs it. That is exactly why the \
+         software is free to run yourself, and why its instructions say so in \
+         the first paragraph.</p>\n\
          <p>Search terms are visible to whoever operates the server while the \
          request is being answered. They are not stored against you.</p>",
     )

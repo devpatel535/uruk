@@ -1,0 +1,97 @@
+# systemd unit for uruk-serve.
+#
+#   sudo cp deploy/uruk.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now uruk
+#
+# Assumes the layout in DEPLOYING.md: binary at /usr/local/bin/uruk, data under
+# /var/lib/uruk, running as a `uruk` system user that owns neither.
+#
+# Every hardening directive below is there because a search engine is a program
+# that accepts strings from strangers and reads files off a disk. The blast
+# radius of getting that wrong is the whole machine unless it is fenced, and
+# these are the cheapest fences systemd offers.
+
+[Unit]
+Description=uruk search
+Documentation=https://github.com/devpatel535/uruk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=uruk
+Group=uruk
+
+# Loopback only. TLS and the public address belong to the reverse proxy, which
+# is also where the logging decision in DEPLOYING.md gets made.
+ExecStart=/usr/local/bin/uruk serve \
+    --index /var/lib/uruk/index \
+    --crawl /var/lib/uruk/crawl \
+    --address 127.0.0.1:8080
+
+Restart=on-failure
+RestartSec=5s
+
+# --- filesystem ---
+# The whole filesystem is read-only to this process, /var/lib/uruk included:
+# `uruk serve` only ever reads. Rebuilding an index is a separate command run
+# by a human or a timer, not something the server does to itself.
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/uruk
+PrivateTmp=true
+PrivateDevices=true
+
+# --- privilege ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Binding 8080 needs no capability. If you change the port to 80 or 443, add
+# the capability rather than running as root:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Better still: leave it on 8080 and let the proxy hold the privileged port.
+
+# --- kernel and namespaces ---
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# --- network ---
+# IPv4, IPv6 and nothing else. The server makes no outbound connections at all:
+# there is no third-party anything on a served page, by design.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# --- syscalls ---
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallArchitectures=native
+
+# --- resources ---
+# Sized from the measurements in RESEARCH.md 6: about 4 KB on disk per indexed
+# page, and posting lists are read per query rather than held in memory. A
+# million-page index does not need a gigabyte, but the page cache will happily
+# use whatever it is given, so this is a ceiling rather than a reservation.
+MemoryMax=2G
+TasksMax=64
+
+# --- logging ---
+# Nothing per-request is written: uruk-serve logs only its start-up lines. This
+# keeps journald from retaining anything, in case a future version gets
+# chattier than this one.
+StandardOutput=null
+StandardError=journal
+LogLevelMax=notice
+
+[Install]
+WantedBy=multi-user.target
