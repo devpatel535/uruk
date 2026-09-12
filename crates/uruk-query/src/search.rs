@@ -25,8 +25,10 @@ use std::collections::{BTreeSet, BinaryHeap};
 use std::time::{Duration, Instant};
 
 use uruk_index::build::IndexError;
+use uruk_index::fields::FieldCounts;
 use uruk_index::index::{DocRef, Index};
-use uruk_index::postings::Posting;
+use uruk_index::postings::{DocPosting, Posting};
+use uruk_index::segment::DocEntry;
 use uruk_link::Authority;
 
 use crate::parse::Query;
@@ -199,8 +201,6 @@ fn search_segment(
     scorer: &Scorer,
     authority: Option<&Authority>,
 ) -> Result<SegmentHits, QueryError> {
-    let mut lists_read = 0;
-
     // A `site:` filter that this segment cannot satisfy skips it entirely,
     // before any posting list is touched.
     let host_filter = match &query.site {
@@ -216,77 +216,233 @@ fn search_segment(
         None => None,
     };
 
-    // Read each required term's list for this segment.
+    // Positions are the largest part of the index and the slowest thing to
+    // decode. Two very common shapes of query provably cannot use them:
+    //
+    //   - one term, with no phrase: there is no proximity between a term and
+    //     itself, so `closest_span` returns `None` whatever the positions say;
+    //   - and in both shapes, an excluded term contributes only a set of
+    //     document ids.
+    //
+    // Reading them anyway was measured at most of the time a single-term query
+    // spent. This is the one branch in the query path that exists purely for
+    // speed, and it is here because the alternative was missing the brief's
+    // latency budget by a factor of ten at a million documents.
+    let needs_positions = !query.phrases.is_empty() || terms.len() > 1;
+
+    let mut lists_read = 0;
+    let hits = if needs_positions {
+        with_positions(
+            index,
+            segment,
+            query,
+            terms,
+            frequencies,
+            scorer,
+            authority,
+            host_filter,
+            &mut lists_read,
+        )?
+    } else {
+        without_positions(
+            index,
+            segment,
+            query,
+            terms,
+            frequencies,
+            scorer,
+            authority,
+            host_filter,
+            &mut lists_read,
+        )?
+    };
+
+    Ok(SegmentHits { hits, lists_read })
+}
+
+/// The path for queries that need positions: any phrase, or any two terms
+/// whose proximity has to be scored.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two paths share a caller and a shape; bundling the arguments \
+              would hide that they are the same arguments"
+)]
+fn with_positions(
+    index: &mut Index,
+    segment: u16,
+    query: &Query,
+    terms: &[&str],
+    frequencies: &[u32],
+    scorer: &Scorer,
+    authority: Option<&Authority>,
+    host_filter: Option<u32>,
+    lists_read: &mut usize,
+) -> Result<Vec<Hit>, QueryError> {
     let mut lists: Vec<Vec<Posting>> = Vec::with_capacity(terms.len());
     for term in terms {
         let postings = index.segment_postings(segment, term)?;
-        lists_read += 1;
+        *lists_read += 1;
         if postings.is_empty() {
             // AND: one absent term ends this segment.
-            return Ok(SegmentHits {
-                hits: Vec::new(),
-                lists_read,
-            });
+            return Ok(Vec::new());
         }
         lists.push(postings);
     }
 
     let candidates = intersect(&lists);
     if candidates.is_empty() {
-        return Ok(SegmentHits {
-            hits: Vec::new(),
-            lists_read,
-        });
+        return Ok(Vec::new());
     }
 
     // Exclusions. Read only now: if nothing matched, they cost nothing.
     let (excluded, exclusion_reads) = excluded_docs(index, segment, query)?;
-    lists_read += exclusion_reads;
+    *lists_read += exclusion_reads;
 
     let mut hits = Vec::new();
     for (doc, postings) in candidates {
-        if excluded.contains(&doc) {
-            continue;
-        }
-        let Some(entry) = index.doc(DocRef { segment, doc }) else {
+        let Some(entry) = keep(index, segment, doc, &excluded, host_filter) else {
             continue;
         };
-        if host_filter.is_some_and(|host| entry.host != host) {
-            continue;
-        }
-
         // Phrases last: the only check that needs positions.
         if !satisfies_phrases(&query.phrases, terms, &postings) {
             continue;
         }
-
-        let contributions: Vec<TermScore> = postings
-            .iter()
-            .zip(terms)
-            .zip(frequencies)
-            .map(|((posting, name), &df)| scorer.term(name, df, posting.counts, entry.lengths))
-            .collect();
-
+        let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
         let span = closest_span(&postings.iter().map(|p| &p.positions).collect::<Vec<_>>());
-        // Authority is a property of the host, so it is looked up once per
-        // document rather than per term, and only for documents that survived
-        // every filter above.
-        let standing = authority.map(|table| {
-            index
-                .host_name(DocRef { segment, doc })
-                .map_or(0.0, |host| table.score(host))
-        });
-        let explanation = scorer.document(contributions, entry.quality, span, standing);
+        hits.push(build_hit(
+            index,
+            segment,
+            doc,
+            &entry,
+            terms,
+            frequencies,
+            &counts,
+            span,
+            scorer,
+            authority,
+        ));
+    }
+    Ok(hits)
+}
 
-        hits.push(Hit {
-            doc: DocRef { segment, doc },
-            crawl_doc: entry.crawl_doc,
-            score: explanation.total,
-            explanation,
-        });
+/// The path for queries that cannot use positions: one term, no phrase.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors `with_positions` deliberately; see there"
+)]
+fn without_positions(
+    index: &mut Index,
+    segment: u16,
+    query: &Query,
+    terms: &[&str],
+    frequencies: &[u32],
+    scorer: &Scorer,
+    authority: Option<&Authority>,
+    host_filter: Option<u32>,
+    lists_read: &mut usize,
+) -> Result<Vec<Hit>, QueryError> {
+    let mut lists: Vec<Vec<DocPosting>> = Vec::with_capacity(terms.len());
+    for term in terms {
+        let postings = index.segment_document_postings(segment, term)?;
+        *lists_read += 1;
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+        lists.push(postings);
     }
 
-    Ok(SegmentHits { hits, lists_read })
+    let candidates = intersect(&lists);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (excluded, exclusion_reads) = excluded_docs(index, segment, query)?;
+    *lists_read += exclusion_reads;
+
+    let mut hits = Vec::new();
+    for (doc, postings) in candidates {
+        let Some(entry) = keep(index, segment, doc, &excluded, host_filter) else {
+            continue;
+        };
+        let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
+        hits.push(build_hit(
+            index,
+            segment,
+            doc,
+            &entry,
+            terms,
+            frequencies,
+            &counts,
+            None,
+            scorer,
+            authority,
+        ));
+    }
+    Ok(hits)
+}
+
+/// A matched document's entry, unless something disqualifies it.
+///
+/// Exclusions and the `site:` filter, in one place so the two paths above
+/// cannot disagree about what a result is allowed to be.
+fn keep(
+    index: &Index,
+    segment: u16,
+    doc: u32,
+    excluded: &BTreeSet<u32>,
+    host_filter: Option<u32>,
+) -> Option<DocEntry> {
+    if excluded.contains(&doc) {
+        return None;
+    }
+    let entry = index.doc(DocRef { segment, doc })?;
+    if host_filter.is_some_and(|host| entry.host != host) {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Score one matched document, whether or not its positions were read.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scoring one document genuinely needs this much context, and \
+              bundling it into a struct would only move the argument list"
+)]
+fn build_hit(
+    index: &Index,
+    segment: u16,
+    doc: u32,
+    entry: &DocEntry,
+    terms: &[&str],
+    frequencies: &[u32],
+    counts: &[FieldCounts],
+    span: Option<u32>,
+    scorer: &Scorer,
+    authority: Option<&Authority>,
+) -> Hit {
+    let contributions: Vec<TermScore> = counts
+        .iter()
+        .zip(terms)
+        .zip(frequencies)
+        .map(|((counts, name), &df)| scorer.term(name, df, *counts, entry.lengths))
+        .collect();
+
+    // Authority is a property of the host, so it is looked up once per
+    // document rather than per term, and only for documents that survived
+    // every filter above.
+    let standing = authority.map(|table| {
+        index
+            .host_name(DocRef { segment, doc })
+            .map_or(0.0, |host| table.score(host))
+    });
+    let explanation = scorer.document(contributions, entry.quality, span, standing);
+
+    Hit {
+        doc: DocRef { segment, doc },
+        crawl_doc: entry.crawl_doc,
+        score: explanation.total,
+        explanation,
+    }
 }
 
 /// Documents this segment must not return, and how many lists that cost.
@@ -302,7 +458,10 @@ fn excluded_docs(
     let mut lists_read = 0;
 
     for term in &query.excluded {
-        let postings = index.segment_postings(segment, term)?;
+        // A single excluded term contributes nothing but a set of document
+        // ids, so its positions are read and discarded. They are the expensive
+        // part; not reading them is free.
+        let postings = index.segment_document_postings(segment, term)?;
         lists_read += 1;
         excluded.extend(postings.iter().map(|posting| posting.doc));
     }
@@ -311,6 +470,8 @@ fn excluded_docs(
         let mut phrase_lists = Vec::with_capacity(phrase.len());
         let mut complete = true;
         for term in phrase {
+            // An excluded phrase does need positions: whether the phrase
+            // actually occurs is the whole question.
             let postings = index.segment_postings(segment, term)?;
             lists_read += 1;
             if postings.is_empty() {
@@ -356,7 +517,28 @@ fn satisfies_phrases(phrases: &[Vec<String>], terms: &[&str], postings: &[Postin
 /// An n-way walk rather than repeated set intersection: the lists are sorted
 /// by document id, so all of them advance together and nothing is allocated
 /// per candidate that is then thrown away.
-fn intersect(lists: &[Vec<Posting>]) -> Vec<(u32, Vec<Posting>)> {
+/// A posting the intersection can walk, with or without its positions.
+///
+/// The walk only ever looks at document ids, so it does not need to know which
+/// kind it has — and writing it twice, once per type, is how the two copies
+/// drift apart.
+trait Matched: Clone {
+    fn doc(&self) -> u32;
+}
+
+impl Matched for Posting {
+    fn doc(&self) -> u32 {
+        self.doc
+    }
+}
+
+impl Matched for DocPosting {
+    fn doc(&self) -> u32 {
+        self.doc
+    }
+}
+
+fn intersect<T: Matched>(lists: &[Vec<T>]) -> Vec<(u32, Vec<T>)> {
     if lists.is_empty() || lists.iter().any(Vec::is_empty) {
         return Vec::new();
     }
@@ -369,7 +551,7 @@ fn intersect(lists: &[Vec<Posting>]) -> Vec<(u32, Vec<Posting>)> {
         let mut target = 0u32;
         for (list, &cursor) in lists.iter().zip(&cursors) {
             match list.get(cursor) {
-                Some(posting) => target = target.max(posting.doc),
+                Some(posting) => target = target.max(posting.doc()),
                 None => return out,
             }
         }
@@ -378,19 +560,19 @@ fn intersect(lists: &[Vec<Posting>]) -> Vec<(u32, Vec<Posting>)> {
         for (list, cursor) in lists.iter().zip(&mut cursors) {
             while list
                 .get(*cursor)
-                .is_some_and(|posting| posting.doc < target)
+                .is_some_and(|posting| posting.doc() < target)
             {
                 *cursor += 1;
             }
             match list.get(*cursor) {
-                Some(posting) if posting.doc == target => {}
+                Some(posting) if posting.doc() == target => {}
                 Some(_) => aligned = false,
                 None => return out,
             }
         }
 
         if aligned {
-            let postings: Vec<Posting> = lists
+            let postings: Vec<T> = lists
                 .iter()
                 .zip(&cursors)
                 .map(|(list, &cursor)| list[cursor].clone())
@@ -538,7 +720,7 @@ mod tests {
         let b = vec![posting(2, &[0])];
         assert!(intersect(&[a.clone(), b]).is_empty());
         assert!(intersect(&[a, Vec::new()]).is_empty());
-        assert!(intersect(&[]).is_empty());
+        assert!(intersect::<Posting>(&[]).is_empty());
     }
 
     #[test]

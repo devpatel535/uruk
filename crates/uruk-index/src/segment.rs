@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::fields::{FIELD_COUNT, Field, FieldCounts, FieldLengths};
-use crate::postings::{self, Posting, read_varint, write_varint};
+use crate::postings::{self, DocPosting, Posting, read_varint, write_varint};
 use crate::tokenize::{self, Token};
 
 /// Positions left empty between one field and the next.
@@ -621,8 +621,38 @@ impl SegmentReader {
     /// This is the whole point of the layout: a query for three words reads
     /// three lists, not the index.
     pub fn postings(&mut self, term: &str) -> Result<Vec<Posting>, SegmentError> {
-        let Some(index) = self.find(term) else {
+        let Some(bytes) = self.posting_bytes(term)? else {
             return Ok(Vec::new());
+        };
+        let mut cursor = 0;
+        postings::decode(&bytes, &mut cursor).map_err(|source| SegmentError::BadPostings {
+            term: term.to_owned(),
+            source,
+        })
+    }
+
+    /// One term's postings without the position stream.
+    ///
+    /// Reads exactly the same bytes off disk — a posting list is one contiguous
+    /// run and seeking past part of it would cost more than reading it — but
+    /// skips decoding the positions, which is where the time goes.
+    pub fn document_postings(&mut self, term: &str) -> Result<Vec<DocPosting>, SegmentError> {
+        let Some(bytes) = self.posting_bytes(term)? else {
+            return Ok(Vec::new());
+        };
+        let mut cursor = 0;
+        postings::decode_documents(&bytes, &mut cursor).map_err(|source| {
+            SegmentError::BadPostings {
+                term: term.to_owned(),
+                source,
+            }
+        })
+    }
+
+    /// The raw bytes of one term's posting list, or `None` if it has none.
+    fn posting_bytes(&mut self, term: &str) -> Result<Option<Vec<u8>>, SegmentError> {
+        let Some(index) = self.find(term) else {
+            return Ok(None);
         };
         let entry = self.dictionary[index].clone();
 
@@ -630,12 +660,7 @@ impl SegmentReader {
             .seek(SeekFrom::Start(self.postings_offset + entry.offset))?;
         let mut bytes = vec![0u8; usize::try_from(entry.length).unwrap_or(0)];
         self.file.read_exact(&mut bytes)?;
-
-        let mut cursor = 0;
-        postings::decode(&bytes, &mut cursor).map_err(|source| SegmentError::BadPostings {
-            term: term.to_owned(),
-            source,
-        })
+        Ok(Some(bytes))
     }
 
     /// Every term, in sorted order. For debugging and for the CLI.

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::build::{IndexError, IndexManifest, read_manifest};
 use crate::fields::Field;
-use crate::postings::Posting;
+use crate::postings::{DocPosting, Posting};
 use crate::segment::{DocEntry, SegmentReader};
 
 /// Where a document lives: which segment, and its id inside it.
@@ -166,6 +166,26 @@ impl Index {
             return Ok(Vec::new());
         }
         Ok(reader.postings(term)?)
+    }
+
+    /// One term's postings from one segment, without decoding positions.
+    ///
+    /// For queries that cannot use them — a single term, or an excluded one.
+    /// Positions are the largest part of the index and the slowest part to
+    /// decode, so this is most of the difference between a query inside the
+    /// brief's latency budget and one outside it.
+    pub fn segment_document_postings(
+        &mut self,
+        segment: u16,
+        term: &str,
+    ) -> Result<Vec<DocPosting>, IndexError> {
+        let Some(reader) = self.segments.get_mut(segment as usize) else {
+            return Ok(Vec::new());
+        };
+        if reader.doc_frequency(term) == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(reader.document_postings(term)?)
     }
 
     /// The host id a `site:` filter should match within one segment.

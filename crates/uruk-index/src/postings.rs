@@ -217,6 +217,34 @@ fn other_fields_mask(counts: FieldCounts) -> u8 {
     counts.mask() & !1
 }
 
+/// A posting with its positions left unread.
+///
+/// # Why this exists
+///
+/// Positions are the largest part of the index and the slowest part to decode
+/// — measured, on a 100,000-document corpus, at most of the time a query
+/// spends. And a great many queries cannot use them:
+///
+/// - a **single-term** query has no proximity to compute and no phrase to
+///   check, so its positions are decoded and then discarded;
+/// - an **excluded** term (`-barley`) contributes nothing but a set of
+///   document ids, whatever its positions say.
+///
+/// The four-stream layout makes skipping them free rather than merely
+/// possible: positions are one contiguous stream at the end of a term's
+/// record, so not reading them is a matter of stopping early. No seeking, and
+/// no format change.
+///
+/// Kept as a separate type rather than a `Posting` with an empty `positions`
+/// because the two are not interchangeable — `Posting`'s invariant is that its
+/// positions match its counts, and a `Posting` that silently had none would
+/// make every phrase query quietly return nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocPosting {
+    pub doc: u32,
+    pub counts: FieldCounts,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("posting list is corrupt at byte {offset}: {reason}")]
 pub struct DecodeError {
@@ -224,17 +252,27 @@ pub struct DecodeError {
     pub reason: &'static str,
 }
 
-/// Decode a term's postings from `input`, starting at `cursor`.
-pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeError> {
-    let fail = |cursor: usize, reason| DecodeError {
+fn fail(cursor: usize, reason: &'static str) -> DecodeError {
+    DecodeError {
         offset: cursor,
         reason,
-    };
+    }
+}
 
+/// Read the document, frequency and field-detail streams.
+///
+/// Everything a posting has except its positions, which are the last stream
+/// and can be left unread. Returns the postings and, alongside each, how many
+/// positions it has — which the caller needs to slice the position stream and
+/// which is exactly the frequency, so it is never stored.
+fn decode_heads(
+    input: &[u8],
+    cursor: &mut usize,
+) -> Result<(Vec<DocPosting>, Vec<usize>), DecodeError> {
     let count = read_varint(input, cursor).ok_or_else(|| fail(*cursor, "truncated length"))?;
     let count = usize::try_from(count).map_err(|_| fail(*cursor, "implausible length"))?;
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     // A corrupt length must not make us allocate gigabytes.
     if count > input.len().saturating_sub(*cursor) + 1 {
@@ -251,12 +289,7 @@ pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeEr
     let mut postings = Vec::with_capacity(count);
     let mut wanted = Vec::with_capacity(count);
     let mut doc = 0u32;
-    let mut positions_expected = 0usize;
 
-    // Nothing here may allocate in proportion to a decoded value: `total` comes
-    // off the disk and a corrupt segment can claim four billion positions for a
-    // single document. The position vectors are sized after the bound check
-    // below, once the claim has been weighed against the bytes that remain.
     for (&gap, &packed) in gaps.iter().zip(&frequencies) {
         doc = doc
             .checked_add(gap)
@@ -292,19 +325,28 @@ pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeEr
             counts.set_index(0, total);
         }
 
-        let count = usize::try_from(total).map_err(|_| fail(*cursor, "frequency too large"))?;
-        positions_expected = positions_expected.saturating_add(count);
-        wanted.push(count);
-        postings.push(Posting {
-            doc,
-            counts,
-            positions: Vec::new(),
-        });
+        wanted.push(usize::try_from(total).map_err(|_| fail(*cursor, "frequency too large"))?);
+        postings.push(DocPosting { doc, counts });
     }
+
+    Ok((postings, wanted))
+}
+
+/// Decode a term's postings, positions included.
+pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeError> {
+    let (heads, wanted) = decode_heads(input, cursor)?;
+    if heads.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let positions_expected: usize = wanted
+        .iter()
+        .fold(0usize, |total, count| total.saturating_add(*count));
 
     // A position cannot cost less than a bit, so a list claiming more positions
     // than the remaining bytes could hold is corrupt. The slack of one byte
-    // covers a stream that is entirely block headers.
+    // covers a stream that is entirely block headers. Checked before anything
+    // is sized from it: `total` came off a disk that may be lying.
     if positions_expected > input.len().saturating_sub(*cursor).saturating_mul(8) + 8 {
         return Err(fail(*cursor, "positions exceed the remaining bytes"));
     }
@@ -312,22 +354,44 @@ pub fn decode(input: &[u8], cursor: &mut usize) -> Result<Vec<Posting>, DecodeEr
         .decode(input, cursor, positions_expected)
         .ok_or_else(|| fail(*cursor, "truncated positions"))?;
 
+    let mut postings = Vec::with_capacity(heads.len());
     let mut at = 0usize;
-    for (posting, &count) in postings.iter_mut().zip(&wanted) {
+    for (head, &count) in heads.iter().zip(&wanted) {
         let slice = deltas
             .get(at..at + count)
             .ok_or_else(|| fail(*cursor, "short positions"))?;
-        posting.positions.reserve_exact(count);
+        let mut positions = Vec::with_capacity(count);
         let mut position = 0u32;
         for &delta in slice {
             position = position
                 .checked_add(delta)
                 .ok_or_else(|| fail(*cursor, "position overflow"))?;
-            posting.positions.push(position);
+            positions.push(position);
         }
         at += count;
+        postings.push(Posting {
+            doc: head.doc,
+            counts: head.counts,
+            positions,
+        });
     }
     Ok(postings)
+}
+
+/// Decode a term's postings without reading the position stream.
+///
+/// For queries that cannot use positions: a single term has no proximity to
+/// compute and no phrase to check, and an excluded term contributes only a set
+/// of document ids. Positions are the largest and slowest part of the index,
+/// so not reading them is the difference between a query that fits the brief's
+/// latency budget and one that does not — see [`DocPosting`].
+///
+/// The cursor is left after the field-detail section rather than at the end of
+/// the list. That is safe because the dictionary holds every term's starting
+/// offset, so nothing reads these lists sequentially — but it does mean this
+/// must not be used to walk a concatenation of lists.
+pub fn decode_documents(input: &[u8], cursor: &mut usize) -> Result<Vec<DocPosting>, DecodeError> {
+    decode_heads(input, cursor).map(|(postings, _)| postings)
 }
 
 #[cfg(test)]

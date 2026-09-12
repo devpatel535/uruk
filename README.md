@@ -130,6 +130,7 @@ Measuring what the index costs, on a corpus large enough to mean something:
 ```sh
 cargo run --release --example index_size  -p uruk-index -- 100000
 cargo run --release --example codec_bench -p uruk-index
+cargo run --release --example query_bench -p uruk-query -- 100000
 ```
 
 At 100,000 documents the index is **29% of the text it describes**, at 3.41
@@ -137,6 +138,14 @@ bytes per posting, and store and index together come to **3,951 bytes per
 indexed page** — about 3.7 GB per million pages, with phrase search and
 proximity intact. Both numbers print on every run, so a change that makes the
 index fatter is visible immediately.
+
+`query_bench` measures the other half of principle 4. At 100,000 documents
+every case is inside the 200ms budget, worst case included — but the worst case
+(two very common terms) sits at 176ms, and the work is linear in corpus size,
+so **it would miss the budget at a million pages**. [RESEARCH.md
+§6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
+has the breakdown of where the time goes and the two changes that would fix it,
+neither of which is written yet.
 
 ## Running your own
 

@@ -1021,6 +1021,121 @@ and does not need to be parallel yet.
 
 ---
 
+## 6b. "Fast to search", measured — and the half of principle 4 nobody had checked
+
+Principle 4 has two halves. §6 measured the first one to three significant
+figures across two corpus sizes. The second half — **sub-200ms** — had never
+been measured at all, at any size, which is a strange thing to leave unchecked
+in something described as non-negotiable.
+
+```sh
+cargo run --release --example query_bench -p uruk-query -- 100000
+```
+
+The cases are the ones that behave differently, not a handy list: the commonest
+term (the worst posting-list read), a rare term (the common case), two common
+terms (the intersection), common-plus-rare, a phrase (the only query that needs
+positions), an exclusion, and a `site:` filter.
+
+### First measurement: it fits, and one case barely
+
+| case | median | worst | matched |
+|---|---|---|---|
+| commonest term | 88.8ms | 97.2ms | 100,000 |
+| rare term | 0.1ms | 0.1ms | 262 |
+| **two common terms** | **175.9ms** | **181.0ms** | 84,234 |
+| common + rare | 37.9ms | 40.3ms | 262 |
+| phrase | 96.9ms | 119.0ms | 10,875 |
+| term with exclusion | 76.9ms | 79.1ms | 15,766 |
+| `site:` filter | 55.3ms | 57.5ms | 200 |
+
+Every case inside 200ms, so the budget is met — at **100,000 documents**, which
+is a tenth of the million-page scale the rest of the design is sized for. The
+per-query work here is linear in the size of the posting lists, so the real
+reading of that table is: *two common terms takes about 1.8 seconds at a
+million pages.* The promise holds at the size measured and fails at the size
+intended.
+
+### What was actually slow, and the part that was simply waste
+
+Positions are the largest part of the index. They were being decoded for every
+query, including queries that provably cannot use them:
+
+- a **single-term** query has no proximity to compute — there is no distance
+  between a term and itself — so `closest_span` returns `None` whatever the
+  positions say;
+- an **excluded** term (`-barley`) contributes nothing but a set of document
+  ids.
+
+In both cases the position stream was decoded and thrown away. The four-stream
+layout from §6 made fixing this almost free: positions are one contiguous
+stream at the end of a term's record, so not reading them is a matter of
+stopping early. No seek, no format change.
+
+| case | before | after |
+|---|---|---|
+| commonest term | 88.8ms | **23.1ms** |
+| term with exclusion | 76.9ms | **21.8ms** |
+| `site:` filter | 55.3ms | **6.1ms** |
+| common + rare | 37.9ms | 31.3ms |
+| phrase | 96.9ms | 92.7ms |
+| two common terms | 175.9ms | **175.8ms** |
+
+Three to nine times faster on everything that could not use positions, and
+exactly nothing on the two cases that can. That is the right shape for a fix
+that removes waste rather than changing what the engine computes.
+
+### Where the remaining 176ms goes
+
+Rather than guess, the proximity calculation was switched off and the benchmark
+re-run:
+
+| | with proximity | without |
+|---|---|---|
+| two common terms | 175.8ms | 101.1ms |
+| phrase | 92.7ms | 80.6ms |
+
+So the worst case splits roughly in half: **~75ms computing proximity** over
+84,234 candidates, and **~75ms decoding position streams** that the proximity
+calculation needs. Two separate problems that happen to cost the same.
+
+Fixing them needs two things this does not yet have:
+
+1. **Score proximity for the top candidates only.** Proximity is a small
+   adjustment to a score dominated by BM25F, so ranking on everything else,
+   keeping the best hundred, and computing proximity for those would cost 1% of
+   the current work. It is not free of consequence: a document ranked 150th
+   without proximity that would have been 5th with it gets missed. That is a
+   real trade-off, it is what every production engine makes, and — now that
+   §5.4's harness exists — it is measurable rather than assertable. It should
+   not be adopted without measuring the nDCG it costs.
+
+2. **Skip pointers into the position stream.** Even to read one document's
+   positions, the stream has to be decoded from the start, because it is
+   sequential by construction. Grouping positions by blocks of documents with a
+   byte offset per block is the standard answer (it is what Lucene's skip lists
+   are for), and it is a format change.
+
+Neither is built. Saying so is better than quietly reporting the 100,000-page
+number as though it settled the question, which is what the table above would
+do on its own.
+
+### The honest position on principle 4
+
+- **Index size: met and measured**, 29% of text with positions, 3,951 bytes per
+  page, stable from 20,000 to 100,000 documents.
+- **Latency: met at 100,000 documents**, including the worst case, and the
+  common cases have a great deal of headroom — a rare term answers in a tenth
+  of a millisecond, and most real queries are mostly rare words.
+- **Latency at a million documents: not met for the worst case**, by roughly a
+  factor of nine, and the two changes that would fix it are named above and not
+  yet written.
+
+A benchmark that only reported the cases that pass would have been easy to
+write and worth nothing.
+
+---
+
 ## 7. Technology choices, argued
 
 **Rust for crawler, indexer and server: agreed**, and not only for speed. The
