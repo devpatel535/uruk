@@ -44,6 +44,17 @@ pub struct Configuration {
     /// proximity and quality alone.
     pub authority: Option<Authority>,
     pub depth: usize,
+    /// Candidates per segment whose proximity is computed, or `None` to score
+    /// every candidate exactly.
+    ///
+    /// This is the knob that makes the engine's one deliberate approximation
+    /// measurable. Proximity for every candidate was half the cost of the
+    /// worst query measured (`RESEARCH.md` §6b), so the shipped default scores
+    /// it for the best few only — which can, in principle, drop a document
+    /// that proximity alone would have lifted into the top ten. Comparing this
+    /// against `None` on a judged set is how the cost of that stops being a
+    /// matter of opinion.
+    pub rescore_depth: Option<usize>,
 }
 
 impl Configuration {
@@ -54,7 +65,19 @@ impl Configuration {
             weights: Weights::default(),
             authority,
             depth: DEFAULT_DEPTH,
+            rescore_depth: Some(uruk_query::search::DEFAULT_RESCORE_DEPTH),
         }
+    }
+
+    /// The same configuration scoring proximity for every candidate.
+    ///
+    /// The exact answer, and the thing the shipped default is approximating.
+    #[must_use]
+    pub fn exact_proximity(&self) -> Self {
+        let mut variant = self.clone();
+        variant.name = String::from("exact proximity");
+        variant.rescore_depth = None;
+        variant
     }
 
     /// The same configuration with one signal switched off.
@@ -132,6 +155,7 @@ pub fn evaluate(
             limit: configuration.depth,
             weights: configuration.weights,
             authority: configuration.authority.as_ref(),
+            rescore_depth: configuration.rescore_depth,
         };
         let results = search(index, &query, &options).map_err(|source| EvalError::Search {
             query: judged.query.clone(),

@@ -53,7 +53,33 @@ pub struct SearchOptions<'a> {
     /// is absent every result's explanation says "not measured" rather than
     /// showing a zero that looks like a judgement.
     pub authority: Option<&'a Authority>,
+    /// How many candidates per segment get their proximity computed.
+    ///
+    /// Proximity needs every occurrence of every query term in a document,
+    /// merged and sorted. Measured on a 100,000-document corpus, doing that
+    /// for all 84,234 documents matching two common terms cost 75ms — about
+    /// half the query (`RESEARCH.md` §6b).
+    ///
+    /// It is also a *small adjustment* to a score dominated by term relevance.
+    /// So: rank on everything else, keep the best few, and compute proximity
+    /// only for those.
+    ///
+    /// **This is an approximation and it can change results.** A document
+    /// ranked below the cut without proximity, which proximity would have
+    /// lifted into the top ten, is missed. `None` disables the cut and scores
+    /// proximity exactly, which is what makes the cost of the approximation
+    /// measurable rather than assertable — `uruk eval` compares the two.
+    pub rescore_depth: Option<usize>,
 }
+
+/// Candidates per segment whose proximity is computed, by default.
+///
+/// A hundred, for a page of ten. A document would have to rank below the
+/// hundredth on term relevance, quality and authority combined, and be rescued
+/// by proximity alone, to be missed — and `query_bench` checks directly that
+/// the approximation returns the same ten results as exact scoring rather than
+/// asserting that it does.
+pub const DEFAULT_RESCORE_DEPTH: usize = 100;
 
 impl Default for SearchOptions<'_> {
     fn default() -> Self {
@@ -61,7 +87,18 @@ impl Default for SearchOptions<'_> {
             limit: 10,
             weights: Weights::default(),
             authority: None,
+            rescore_depth: Some(DEFAULT_RESCORE_DEPTH),
         }
+    }
+}
+
+impl SearchOptions<'_> {
+    /// Candidates to rescore per segment, never fewer than are returned.
+    ///
+    /// Rescoring fewer candidates than the page shows would mean ranking the
+    /// page by a score some of its own results never received.
+    fn depth(&self) -> Option<usize> {
+        self.rescore_depth.map(|depth| depth.max(self.limit).max(1))
     }
 }
 
@@ -150,22 +187,24 @@ pub fn search(
     };
     let scorer = Scorer::new(stats, options.weights);
 
+    let plan = Pass {
+        query,
+        terms: &terms,
+        frequencies: &frequencies,
+        scorer: &scorer,
+        authority: options.authority,
+        host_filter: None,
+        depth: options.depth(),
+    };
+
     // A min-heap of the best `limit` seen so far: pushing and popping the
     // smallest keeps memory at `limit` rather than at the number of matches.
     let mut best: BinaryHeap<Reverse<Ranked>> = BinaryHeap::new();
 
     for segment in 0..u16::try_from(index.segment_count()).unwrap_or(u16::MAX) {
-        let found = search_segment(
-            index,
-            segment,
-            query,
-            &terms,
-            &frequencies,
-            &scorer,
-            options.authority,
-        )?;
+        let found = search_segment(index, segment, &plan)?;
         results.lists_read += found.lists_read;
-        results.matched += found.hits.len();
+        results.matched += found.matched;
 
         for hit in found.hits {
             if best.len() < options.limit {
@@ -189,18 +228,41 @@ pub fn search(
 
 struct SegmentHits {
     hits: Vec<Hit>,
+    /// Documents that matched, which is not `hits.len()` once rescoring cuts
+    /// the list: a search that says "84,234 documents matched" must say so
+    /// whether or not it scored all of them.
+    matched: usize,
     lists_read: usize,
+}
+
+/// Everything one segment's pass needs, other than the index itself.
+///
+/// A struct rather than nine parameters repeated across four functions: the
+/// paths below take exactly the same context, and the point of naming it is
+/// that they cannot quietly start taking different context. Built once per
+/// query and copied per segment with that segment's host filter filled in.
+#[derive(Clone, Copy)]
+struct Pass<'a> {
+    query: &'a Query,
+    terms: &'a [&'a str],
+    frequencies: &'a [u32],
+    scorer: &'a Scorer,
+    authority: Option<&'a Authority>,
+    /// The `site:` filter's host id in this segment, if there is one.
+    host_filter: Option<u32>,
+    /// Candidates to rescore with proximity, or `None` to score all of them
+    /// exactly. See [`SearchOptions::rescore_depth`].
+    depth: Option<usize>,
 }
 
 fn search_segment(
     index: &mut Index,
     segment: u16,
-    query: &Query,
-    terms: &[&str],
-    frequencies: &[u32],
-    scorer: &Scorer,
-    authority: Option<&Authority>,
+    plan: &Pass<'_>,
 ) -> Result<SegmentHits, QueryError> {
+    let query = plan.query;
+    let terms = plan.terms;
+
     // A `site:` filter that this segment cannot satisfy skips it entirely,
     // before any posting list is touched.
     let host_filter = match &query.site {
@@ -209,6 +271,7 @@ fn search_segment(
             None => {
                 return Ok(SegmentHits {
                     hits: Vec::new(),
+                    matched: 0,
                     lists_read: 0,
                 });
             }
@@ -225,160 +288,139 @@ fn search_segment(
     //     document ids.
     //
     // Reading them anyway was measured at most of the time a single-term query
-    // spent. This is the one branch in the query path that exists purely for
-    // speed, and it is here because the alternative was missing the brief's
-    // latency budget by a factor of ten at a million documents.
+    // spent (`RESEARCH.md` §6b). This is the one branch in the query path that
+    // exists purely for speed.
     let needs_positions = !query.phrases.is_empty() || terms.len() > 1;
 
-    let mut lists_read = 0;
-    let hits = if needs_positions {
-        with_positions(
-            index,
-            segment,
-            query,
-            terms,
-            frequencies,
-            scorer,
-            authority,
-            host_filter,
-            &mut lists_read,
-        )?
-    } else {
-        without_positions(
-            index,
-            segment,
-            query,
-            terms,
-            frequencies,
-            scorer,
-            authority,
-            host_filter,
-            &mut lists_read,
-        )?
+    let pass = Pass {
+        host_filter,
+        ..*plan
     };
 
-    Ok(SegmentHits { hits, lists_read })
+    let mut lists_read = 0;
+    let (hits, matched) = if needs_positions {
+        with_positions(index, segment, &pass, &mut lists_read)?
+    } else {
+        without_positions(index, segment, &pass, &mut lists_read)?
+    };
+
+    Ok(SegmentHits {
+        hits,
+        matched,
+        lists_read,
+    })
 }
 
 /// The path for queries that need positions: any phrase, or any two terms
 /// whose proximity has to be scored.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the two paths share a caller and a shape; bundling the arguments \
-              would hide that they are the same arguments"
-)]
+///
+/// Two phases, and the second one is the interesting part. Every candidate is
+/// scored on term relevance, quality and authority. Only the best
+/// [`Pass::depth`] of them then get their proximity computed — because
+/// proximity is a small adjustment to a score those three already dominate,
+/// and computing it for every candidate was half the cost of the worst query
+/// measured.
 fn with_positions(
     index: &mut Index,
     segment: u16,
-    query: &Query,
-    terms: &[&str],
-    frequencies: &[u32],
-    scorer: &Scorer,
-    authority: Option<&Authority>,
-    host_filter: Option<u32>,
+    pass: &Pass<'_>,
     lists_read: &mut usize,
-) -> Result<Vec<Hit>, QueryError> {
-    let mut lists: Vec<Vec<Posting>> = Vec::with_capacity(terms.len());
-    for term in terms {
+) -> Result<(Vec<Hit>, usize), QueryError> {
+    let mut lists: Vec<Vec<Posting>> = Vec::with_capacity(pass.terms.len());
+    for term in pass.terms {
         let postings = index.segment_postings(segment, term)?;
         *lists_read += 1;
         if postings.is_empty() {
             // AND: one absent term ends this segment.
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         lists.push(postings);
     }
 
     let candidates = intersect(&lists);
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     // Exclusions. Read only now: if nothing matched, they cost nothing.
-    let (excluded, exclusion_reads) = excluded_docs(index, segment, query)?;
+    let (excluded, exclusion_reads) = excluded_docs(index, segment, pass.query)?;
     *lists_read += exclusion_reads;
 
-    let mut hits = Vec::new();
+    // --- phase one: everything except proximity ---
+    let mut scored: Vec<(f64, u32, DocEntry, Vec<Posting>)> = Vec::new();
     for (doc, postings) in candidates {
-        let Some(entry) = keep(index, segment, doc, &excluded, host_filter) else {
+        let Some(entry) = keep(index, segment, doc, &excluded, pass.host_filter) else {
             continue;
         };
-        // Phrases last: the only check that needs positions.
-        if !satisfies_phrases(&query.phrases, terms, &postings) {
+        // Phrases before scoring: a document that does not contain the phrase
+        // is not a match at all, so it must not occupy a rescoring slot.
+        if !satisfies_phrases(&pass.query.phrases, pass.terms, &postings) {
             continue;
         }
         let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
-        let span = closest_span(&postings.iter().map(|p| &p.positions).collect::<Vec<_>>());
-        hits.push(build_hit(
-            index,
-            segment,
-            doc,
-            &entry,
-            terms,
-            frequencies,
-            &counts,
-            span,
-            scorer,
-            authority,
-        ));
+        let without = build_hit(index, segment, doc, &entry, pass, &counts, None);
+        scored.push((without.score, doc, entry, postings));
     }
-    Ok(hits)
+    let matched = scored.len();
+
+    // --- phase two: proximity, for the candidates that could still place ---
+    if let Some(depth) = pass.depth
+        && scored.len() > depth
+    {
+        // `select_nth_unstable` partitions in linear time rather than sorting:
+        // the order within the kept set does not matter, because every one of
+        // them is about to be rescored and re-ranked anyway.
+        scored.select_nth_unstable_by(depth, |a, b| b.0.total_cmp(&a.0));
+        scored.truncate(depth);
+    }
+
+    let mut hits = Vec::with_capacity(scored.len());
+    for (_, doc, entry, postings) in scored {
+        let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
+        let span = closest_span(&postings.iter().map(|p| &p.positions).collect::<Vec<_>>());
+        hits.push(build_hit(index, segment, doc, &entry, pass, &counts, span));
+    }
+    Ok((hits, matched))
 }
 
 /// The path for queries that cannot use positions: one term, no phrase.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors `with_positions` deliberately; see there"
-)]
+///
+/// No rescoring phase, because there is nothing to rescore with: proximity is
+/// `None` for a single term by definition.
 fn without_positions(
     index: &mut Index,
     segment: u16,
-    query: &Query,
-    terms: &[&str],
-    frequencies: &[u32],
-    scorer: &Scorer,
-    authority: Option<&Authority>,
-    host_filter: Option<u32>,
+    pass: &Pass<'_>,
     lists_read: &mut usize,
-) -> Result<Vec<Hit>, QueryError> {
-    let mut lists: Vec<Vec<DocPosting>> = Vec::with_capacity(terms.len());
-    for term in terms {
+) -> Result<(Vec<Hit>, usize), QueryError> {
+    let mut lists: Vec<Vec<DocPosting>> = Vec::with_capacity(pass.terms.len());
+    for term in pass.terms {
         let postings = index.segment_document_postings(segment, term)?;
         *lists_read += 1;
         if postings.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         lists.push(postings);
     }
 
     let candidates = intersect(&lists);
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
-    let (excluded, exclusion_reads) = excluded_docs(index, segment, query)?;
+    let (excluded, exclusion_reads) = excluded_docs(index, segment, pass.query)?;
     *lists_read += exclusion_reads;
 
     let mut hits = Vec::new();
     for (doc, postings) in candidates {
-        let Some(entry) = keep(index, segment, doc, &excluded, host_filter) else {
+        let Some(entry) = keep(index, segment, doc, &excluded, pass.host_filter) else {
             continue;
         };
         let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
-        hits.push(build_hit(
-            index,
-            segment,
-            doc,
-            &entry,
-            terms,
-            frequencies,
-            &counts,
-            None,
-            scorer,
-            authority,
-        ));
+        hits.push(build_hit(index, segment, doc, &entry, pass, &counts, None));
     }
-    Ok(hits)
+    let matched = hits.len();
+    Ok((hits, matched))
 }
 
 /// A matched document's entry, unless something disqualifies it.
@@ -402,40 +444,34 @@ fn keep(
     Some(entry)
 }
 
-/// Score one matched document, whether or not its positions were read.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "scoring one document genuinely needs this much context, and \
-              bundling it into a struct would only move the argument list"
-)]
+/// Score one matched document, with or without its proximity.
 fn build_hit(
     index: &Index,
     segment: u16,
     doc: u32,
     entry: &DocEntry,
-    terms: &[&str],
-    frequencies: &[u32],
+    pass: &Pass<'_>,
     counts: &[FieldCounts],
     span: Option<u32>,
-    scorer: &Scorer,
-    authority: Option<&Authority>,
 ) -> Hit {
     let contributions: Vec<TermScore> = counts
         .iter()
-        .zip(terms)
-        .zip(frequencies)
-        .map(|((counts, name), &df)| scorer.term(name, df, *counts, entry.lengths))
+        .zip(pass.terms)
+        .zip(pass.frequencies)
+        .map(|((counts, name), &df)| pass.scorer.term(name, df, *counts, entry.lengths))
         .collect();
 
     // Authority is a property of the host, so it is looked up once per
     // document rather than per term, and only for documents that survived
     // every filter above.
-    let standing = authority.map(|table| {
+    let standing = pass.authority.map(|table| {
         index
             .host_name(DocRef { segment, doc })
             .map_or(0.0, |host| table.score(host))
     });
-    let explanation = scorer.document(contributions, entry.quality, span, standing);
+    let explanation = pass
+        .scorer
+        .document(contributions, entry.quality, span, standing);
 
     Hit {
         doc: DocRef { segment, doc },
@@ -444,7 +480,6 @@ fn build_hit(
         explanation,
     }
 }
-
 /// Documents this segment must not return, and how many lists that cost.
 ///
 /// Separate from the main pass so that nothing is read for exclusions until

@@ -154,36 +154,66 @@ struct Timing {
     query: String,
     median: Duration,
     worst: Duration,
+    /// The same query with proximity scored for every candidate: the exact
+    /// answer the default is approximating.
+    exact_median: Duration,
+    /// Whether the approximation returned a different page of results.
+    ///
+    /// The honest way to price an approximation: run both and compare what a
+    /// person would actually see, rather than reason about when it could
+    /// differ in principle.
+    same_results: bool,
     matched: usize,
     lists_read: usize,
 }
 
-fn time(index: &mut Index, name: &'static str, raw: &str) -> Timing {
+/// Run one query `REPEATS` times and return the sorted timings plus the page
+/// of results it produced.
+fn run(
+    index: &mut Index,
+    raw: &str,
+    options: &SearchOptions<'_>,
+) -> (Vec<Duration>, Vec<u32>, usize, usize) {
     let query = parse::parse(raw);
-    let options = SearchOptions::default();
 
     // One untimed run, so the first query's page faults are not charged to the
     // measurement. A cold cache is a real cost, but it is a different question
     // from how long the work takes.
-    let _ = search(index, &query, &options).expect("search");
+    let _ = search(index, &query, options).expect("search");
 
     let mut samples = Vec::with_capacity(REPEATS);
+    let mut page = Vec::new();
     let mut matched = 0;
     let mut lists_read = 0;
     for _ in 0..REPEATS {
         let started = Instant::now();
-        let results = search(index, &query, &options).expect("search");
+        let results = search(index, &query, options).expect("search");
         samples.push(started.elapsed());
+        page = results.hits.iter().map(|hit| hit.crawl_doc).collect();
         matched = results.matched;
         lists_read = results.lists_read;
     }
     samples.sort_unstable();
+    (samples, page, matched, lists_read)
+}
+
+fn time(index: &mut Index, name: &'static str, raw: &str) -> Timing {
+    let default = SearchOptions::default();
+    let exact = SearchOptions {
+        rescore_depth: None,
+        ..SearchOptions::default()
+    };
+
+    let (samples, page, matched, lists_read) = run(index, raw, &default);
+    let (exact_samples, exact_page, _, _) = run(index, raw, &exact);
 
     Timing {
         name,
         query: raw.to_owned(),
         median: samples[samples.len() / 2],
         worst: samples[samples.len() - 1],
+        exact_median: exact_samples[exact_samples.len() / 2],
+        same_results: page == exact_page,
         matched,
         lists_read,
     }
@@ -201,18 +231,36 @@ fn term_by_rank(words: &[String], rank: usize) -> &str {
 fn report(documents: usize, segments: usize, cases: &[Timing]) {
     println!("\n=== {documents} documents, {segments} segments ===");
     println!(
-        "  {:<26} {:>10} {:>10} {:>12} {:>7}",
-        "case", "median", "worst", "matched", "lists"
+        "  {:<26} {:>10} {:>10} {:>12} {:>12} {:>7}",
+        "case", "median", "worst", "exact", "matched", "lists"
     );
     for case in cases {
         println!(
-            "  {:<26} {:>8.1}ms {:>8.1}ms {:>12} {:>7}",
+            "  {:<26} {:>8.1}ms {:>8.1}ms {:>10.1}ms {:>12} {:>7}",
             case.name,
             case.median.as_secs_f64() * 1000.0,
             case.worst.as_secs_f64() * 1000.0,
+            case.exact_median.as_secs_f64() * 1000.0,
             case.matched,
             case.lists_read
         );
+    }
+
+    // The engine's one deliberate approximation: proximity is scored for the
+    // best hundred candidates rather than all of them. `exact` above is the
+    // same query without that cut. If the two ever return different pages, the
+    // speed was bought with results and the price has to be quoted.
+    let differing: Vec<&Timing> = cases.iter().filter(|case| !case.same_results).collect();
+    if differing.is_empty() {
+        println!(
+            "\n  the rescoring cut returned the same results as exact proximity\n  \
+             scoring on every case above."
+        );
+    } else {
+        println!("\n  THE RESCORING CUT CHANGED THE RESULTS FOR:");
+        for case in differing {
+            println!("    {}", case.name);
+        }
     }
 
     println!("\n  queries run:");

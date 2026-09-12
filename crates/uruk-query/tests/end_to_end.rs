@@ -127,6 +127,16 @@ impl Searchable {
         search(&mut self.index, &query, &SearchOptions::default()).expect("search should succeed")
     }
 
+    /// The same query with proximity scored for every candidate.
+    fn run_exact(&mut self, raw: &str) -> Results {
+        let query = parse::parse(raw);
+        let options = SearchOptions {
+            rescore_depth: None,
+            ..SearchOptions::default()
+        };
+        search(&mut self.index, &query, &options).expect("search should succeed")
+    }
+
     /// URLs of the hits, in rank order.
     fn urls(&mut self, raw: &str) -> Vec<String> {
         let results = self.run(raw);
@@ -402,4 +412,53 @@ fn stopwords_are_searchable_because_they_were_indexed() {
     let urls = engine.urls("\"a long argument with sediment\"");
     assert_eq!(urls.len(), 1, "got {urls:?}");
     assert!(urls[0].contains("harbours.test"));
+}
+
+#[test]
+fn the_rescoring_cut_does_not_change_the_results_it_returns() {
+    // The engine scores proximity for the best hundred candidates rather than
+    // all of them, because doing it for all of them was half the cost of the
+    // worst query measured (`RESEARCH.md` §6b). That is an approximation, and
+    // an approximation nobody checks is a bug with a good excuse.
+    //
+    // This corpus is far smaller than the cut, so every candidate is rescored
+    // either way and the two must agree exactly — which is the point: it pins
+    // the invariant that the cut only ever removes candidates that were going
+    // to lose anyway, and it will fail loudly if the cut is ever applied
+    // before the other signals have ranked the field.
+    let mut engine = prepare("rescore_cut_agrees", 64);
+
+    for query in [
+        "clay tablets",
+        "\"clay tablets\"",
+        "tablets barley",
+        "scribes -barley",
+        "site:scribes.test tablets",
+        "tablets",
+        "barley rations temple",
+    ] {
+        let approximate = engine.run(query);
+        let exact = engine.run_exact(query);
+
+        let approximate_docs: Vec<u32> = approximate.hits.iter().map(|h| h.crawl_doc).collect();
+        let exact_docs: Vec<u32> = exact.hits.iter().map(|h| h.crawl_doc).collect();
+        assert_eq!(
+            approximate_docs, exact_docs,
+            "the rescoring cut changed the results for {query:?}"
+        );
+        assert_eq!(
+            approximate.matched, exact.matched,
+            "the match count changed for {query:?}, so it is counting scored hits \
+             rather than matches"
+        );
+
+        for (a, b) in approximate.hits.iter().zip(&exact.hits) {
+            assert!(
+                (a.score - b.score).abs() < 1e-12,
+                "the same document scored differently for {query:?}: {} vs {}",
+                a.score,
+                b.score
+            );
+        }
+    }
 }

@@ -104,6 +104,9 @@ Claims worth being precise about, each of which has a test:
   is 84% of the corpus scores that farm zero.
 - A ranking change is measured, not argued about — and `uruk eval` refuses to
   call a difference significant on too few queries, however large it is.
+- The engine's one deliberate approximation — scoring proximity for the best
+  hundred candidates rather than all of them — is checked by running both and
+  comparing the results, not asserted.
 - The server writes no access log and no record of any query. A test runs the
   real binary, searches for a unique string, and fails if that string appears
   in anything the process wrote.
@@ -120,7 +123,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 376 tests
+cargo test --workspace          # 377 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -140,12 +143,13 @@ proximity intact. Both numbers print on every run, so a change that makes the
 index fatter is visible immediately.
 
 `query_bench` measures the other half of principle 4. At 100,000 documents
-every case is inside the 200ms budget, worst case included — but the worst case
-(two very common terms) sits at 176ms, and the work is linear in corpus size,
-so **it would miss the budget at a million pages**. [RESEARCH.md
+every case is inside the 200ms budget with the worst at **98.5ms**, down from
+176ms when it was first measured. The work is linear in corpus size, so the
+budget holds to roughly 200,000 documents and the worst case would still miss
+it at a million. [RESEARCH.md
 §6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
-has the breakdown of where the time goes and the two changes that would fix it,
-neither of which is written yet.
+has the breakdown, what was fixed, and the one remaining change — skip pointers
+into the position stream — which is not written.
 
 ## Running your own
 

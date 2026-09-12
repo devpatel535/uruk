@@ -1085,7 +1085,7 @@ Three to nine times faster on everything that could not use positions, and
 exactly nothing on the two cases that can. That is the right shape for a fix
 that removes waste rather than changing what the engine computes.
 
-### Where the remaining 176ms goes
+### Where the remaining 176ms went
 
 Rather than guess, the proximity calculation was switched off and the benchmark
 re-run:
@@ -1095,44 +1095,86 @@ re-run:
 | two common terms | 175.8ms | 101.1ms |
 | phrase | 92.7ms | 80.6ms |
 
-So the worst case splits roughly in half: **~75ms computing proximity** over
-84,234 candidates, and **~75ms decoding position streams** that the proximity
-calculation needs. Two separate problems that happen to cost the same.
+So the worst case split roughly in half: **~75ms computing proximity** over
+84,234 candidates, and **~75ms decoding the position streams** that computation
+needs. Two separate problems that happened to cost the same.
 
-Fixing them needs two things this does not yet have:
+### Fixing the first half: score proximity for the candidates that can still place
 
-1. **Score proximity for the top candidates only.** Proximity is a small
-   adjustment to a score dominated by BM25F, so ranking on everything else,
-   keeping the best hundred, and computing proximity for those would cost 1% of
-   the current work. It is not free of consequence: a document ranked 150th
-   without proximity that would have been 5th with it gets missed. That is a
-   real trade-off, it is what every production engine makes, and — now that
-   §5.4's harness exists — it is measurable rather than assertable. It should
-   not be adopted without measuring the nDCG it costs.
+Proximity is a *small adjustment* to a score dominated by term relevance,
+quality and authority. So the query now runs in two phases: rank every
+candidate on everything else, keep the best hundred per segment, and compute
+proximity only for those.
 
-2. **Skip pointers into the position stream.** Even to read one document's
-   positions, the stream has to be decoded from the start, because it is
-   sequential by construction. Grouping positions by blocks of documents with a
-   byte offset per block is the standard answer (it is what Lucene's skip lists
-   are for), and it is a format change.
+| case | one phase | two phase | exact proximity |
+|---|---|---|---|
+| **two common terms** | 175.8ms | **91.4ms** | 192.6ms |
+| phrase | 92.7ms | **79.0ms** | 97.9ms |
+| commonest term | 23.1ms | 23.6ms | 24.6ms |
+| rare term | 0.1ms | 0.1ms | 0.0ms |
 
-Neither is built. Saying so is better than quietly reporting the 100,000-page
-number as though it settled the question, which is what the table above would
-do on its own.
+**This is an approximation, and it is the only one in the engine.** A document
+ranked below the hundredth on every other signal, which proximity alone would
+have lifted into the top ten, is missed. That is a real cost and the reason to
+be careful: an approximation nobody checks is a bug with a good excuse.
 
-### The honest position on principle 4
+So it is checked, in the most direct way available — run both and compare what
+a person would actually see. `query_bench` runs every case twice, once with the
+cut and once with proximity scored for all 84,234 candidates, and reports
+whether the two returned different pages:
 
-- **Index size: met and measured**, 29% of text with positions, 3,951 bytes per
-  page, stable from 20,000 to 100,000 documents.
-- **Latency: met at 100,000 documents**, including the worst case, and the
-  common cases have a great deal of headroom — a rare term answers in a tenth
-  of a millisecond, and most real queries are mostly rare words.
-- **Latency at a million documents: not met for the worst case**, by roughly a
-  factor of nine, and the two changes that would fix it are named above and not
-  yet written.
+```text
+  the rescoring cut returned the same results as exact proximity
+  scoring on every case above.
+```
 
-A benchmark that only reported the cases that pass would have been easy to
-write and worth nothing.
+There is also a test that pins the invariant on a corpus smaller than the cut,
+where the two must agree exactly, so that a future change applying the cut
+*before* the other signals have ranked the field fails loudly rather than
+quietly returning slightly worse results.
+
+The `exact proximity` column stays, and `uruk eval` can switch between the two,
+so the day somebody has a real judged query set the cost of this approximation
+is a command rather than an argument.
+
+### The second half is not fixed, and needs a format change
+
+Decoding the position streams is still ~75ms of the worst case, because even to
+read one document's positions the stream must be decoded from its start: it is
+sequential by construction. The two-phase scoring above knows exactly which
+hundred documents it wants, and has no way to ask for only those.
+
+The standard answer is **skip pointers**: group positions by blocks of
+documents and store a byte offset per block, so a reader can jump. It is what
+Lucene's skip lists are for. It is a change to the on-disk format, and it is
+not written.
+
+### Where principle 4 actually stands
+
+| | promise | measured |
+|---|---|---|
+| Index size | "small on disk" | **met** — 29% of text with positions, 3,951 bytes per page, stable from 20k to 100k documents |
+| Latency, 100k documents | sub-200ms | **met**, worst case 98.5ms — half the budget |
+| Latency, 1M documents | sub-200ms | **not met for the worst case**, by roughly a factor of five |
+
+The worst case is two *very* common terms — in this corpus the rank-1 term
+appears in every document, which is what "the" does in English. The engine
+keeps stopwords deliberately (§5.7), so such queries are possible; they are
+also not what most people type, and every other case has an order of magnitude
+of headroom. A rare term answers in a tenth of a millisecond at 100,000
+documents and would answer in about a millisecond at ten million.
+
+Two honest readings, and both belong here:
+
+- **The budget holds today** for any corpus up to roughly 200,000 documents,
+  which is more than a self-hosted topical index is likely to be.
+- **The budget does not hold at the scale the rest of the design is sized
+  for**, and the single remaining fix is named above.
+
+Halving the worst case twice over — 176ms to 98.5ms, on top of 88.8ms to 23.1ms
+for the common cases — came from measuring first and changing second. The
+benchmark that only reports the cases that pass would have been easier to write
+and worth nothing.
 
 ---
 
