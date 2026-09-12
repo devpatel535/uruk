@@ -36,13 +36,40 @@ What is built, against the brief's order of work:
 | 7. Web front end | done |
 | 8. Privacy hardening and self-host packaging | done — see [DEPLOYING.md](DEPLOYING.md) |
 | 9. Scale the crawl, tune against a judged query set | harness done (`uruk eval`: nDCG, coverage, a significance test); the crawl itself is blocked on choosing a subject area |
-| 10. Release quietly | not started |
+| 10. Release quietly | yours to decide — nothing is published |
 | 11. Browser | much later, as agreed |
 
 [`RESEARCH.md`](RESEARCH.md) is still the thing to read before anything else.
 It covers what engines of that era actually did, which of their failures this
 is designed around, and — the part that matters — where the brief's plan does
 not survive contact with the 2026 web.
+
+### What is deliberately not done
+
+Named here rather than discovered later. Each has a section in `RESEARCH.md`
+explaining the reasoning, and none of them is a to-do that was forgotten.
+
+- **Sub-200ms at a million pages, worst case.** The budget holds to roughly
+  200,000 documents (worst case 98.5ms, measured). At a million the worst case
+  — two very common terms — is about 900ms. Two changes would fix it, skip
+  pointers into the position stream and block-max WAND, and
+  [§6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
+  has the arithmetic for why it needs both.
+- **A real judged query set.** The harness exists; the judgments are a human
+  judgement about a specific corpus and cannot be generated. See
+  `crates/uruk-eval/examples/judgments.example.txt`.
+- **Anchor text as an index field.** The link graph now stores anchors, so it
+  is available — but adding a field changes the segment format, and §5.4's
+  argument stands: add it with a way to measure whether it helped.
+- **Segment merging.** An index is written as segments and they are never
+  merged, so a query reads every segment's dictionary.
+- **A public suffix list**, for deciding when two hosts are the same site.
+  The current approximation errs towards discarding votes rather than
+  inventing them, which is the safe direction, and there is a test pinning the
+  cases it gets wrong.
+- **Rate limiting.** Discussed in [DEPLOYING.md](DEPLOYING.md); the honest
+  options all trade against the privacy promise, so it is an operator's
+  decision rather than a default.
 
 ## Principles
 
