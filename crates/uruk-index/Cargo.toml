@@ -1,0 +1,29 @@
+[package]
+name = "uruk-index"
+description = "Uruk's inverted index: turns crawled text into something searchable in milliseconds."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# Justifications:
+#   uruk-crawl - reads the crawl store this indexes
+#   serde      - the segment manifest, which is JSON so it can be read by a
+#                human debugging an index without a tool
+#   thiserror  - typed errors
+#
+# Note what is absent: no compression crate. Postings are delta-encoded and
+# variable-byte coded by hand in postings.rs, because Phase 5 benchmarks
+# alternative codecs against each other and that needs our own baseline to
+# measure. Zstd on the whole file would make the comparison meaningless.
+[dependencies]
+uruk-crawl = { path = "../uruk-crawl" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[lints]
+workspace = true

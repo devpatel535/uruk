@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/uruk", "crates/uruk-crawl"]
+members = ["crates/uruk", "crates/uruk-crawl", "crates/uruk-index"]
 
 # Shared metadata. Component crates (uruk-crawl, uruk-index, uruk-query,
 # uruk-serve) inherit from here as they are designed and added.

@@ -1676,6 +1676,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "uruk-index"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uruk-crawl",
+]
+
+[[package]]
 name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
