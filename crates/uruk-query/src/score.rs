@@ -279,6 +279,40 @@ impl Scorer {
         (text * links * scripts).clamp(0.0, 1.0)
     }
 
+    /// A document's score, with nothing allocated and nothing explained.
+    ///
+    /// The first of the two scoring phases runs over every candidate — 84,234
+    /// of them for two common terms on a 100,000-document corpus — and keeps a
+    /// hundred. Building an [`Explanation`] for all of them means a `Vec` of
+    /// [`TermScore`], each of which owns a copy of the term string, for every
+    /// candidate that is about to be discarded.
+    ///
+    /// This computes the same number by the same arithmetic and allocates
+    /// nothing. [`Self::document`] then produces the explanation for the
+    /// survivors, and a test asserts the two agree — because two ways of
+    /// computing one score is exactly the kind of duplication that drifts.
+    ///
+    /// Proximity is deliberately absent: it is what the second phase is for,
+    /// and including a zero for it here would be the same number anyway.
+    pub fn score_without_proximity(
+        &self,
+        doc_frequencies: &[u32],
+        counts: &[FieldCounts],
+        lengths: FieldLengths,
+        quality: DocQuality,
+        authority: Option<f64>,
+    ) -> f64 {
+        let mut total = 0.0;
+        for (&doc_frequency, &counts) in doc_frequencies.iter().zip(counts) {
+            let idf = idf(self.stats.documents, doc_frequency);
+            let pseudo = self.pseudo_frequency(counts, lengths);
+            total += idf * pseudo / (self.weights.k1 + pseudo);
+        }
+        total += self.weights.authority * authority.unwrap_or(0.0).clamp(0.0, 1.0);
+        total += self.weights.quality * Self::quality_factor(quality);
+        total
+    }
+
     /// Score a document, and say why.
     ///
     /// `authority` is the host's standing in `0.0..=1.0`, or `None` when no
@@ -535,6 +569,64 @@ mod tests {
 
             let from_terms: f64 = explanation.terms.iter().map(|t| t.contribution).sum();
             assert!((explanation.text_relevance - from_terms).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn the_fast_score_and_the_explained_score_agree() {
+        // There are now two ways to compute a document's score: the allocating
+        // one that explains itself, and the one the first scoring phase uses
+        // on every candidate. Two implementations of one number drift, so this
+        // pins them together across a spread of inputs.
+        let scorer = Scorer::new(stats(), Weights::default());
+        let lengths = lengths(120, 6);
+
+        for (df, body, title) in [
+            (50u32, 3u32, 0u32),
+            (1, 1, 0),
+            (999, 40, 2),
+            (7, 0, 5),
+            (500, 12, 1),
+        ] {
+            for standing in [None, Some(0.0), Some(0.37), Some(1.0)] {
+                for quality in [
+                    DocQuality {
+                        text_ratio: 0.3,
+                        link_density: 0.2,
+                        scripts: 5,
+                    },
+                    DocQuality {
+                        text_ratio: 0.0,
+                        link_density: 1.0,
+                        scripts: 99,
+                    },
+                ] {
+                    let mut counts = FieldCounts::default();
+                    counts.set(Field::Body, body);
+                    counts.set(Field::Title, title);
+
+                    let fast = scorer.score_without_proximity(
+                        &[df],
+                        &[counts],
+                        lengths,
+                        quality,
+                        standing,
+                    );
+                    let explained = scorer
+                        .document(
+                            vec![scorer.term("clay", df, counts, lengths)],
+                            quality,
+                            None,
+                            standing,
+                        )
+                        .total;
+                    assert!(
+                        (fast - explained).abs() < 1e-12,
+                        "{fast} vs {explained} for df={df} body={body} title={title} \
+                         standing={standing:?}"
+                    );
+                }
+            }
         }
     }
 

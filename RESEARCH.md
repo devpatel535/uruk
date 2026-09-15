@@ -1193,34 +1193,102 @@ each rather than the whole stream being walked per document, but there is no
 version of this where a phrase over the two commonest words in a corpus is
 cheap.
 
-### What is left
+### Third: stop doing work that is thrown away
 
-Scoring is now the largest remaining cost: reading document ids and
-frequencies for every candidate and scoring all 84,234 of them. No amount of
-position cleverness touches it. The fix is **top-k pruning** — storing a
-maximum score bound per block of postings so the traversal can skip blocks that
-cannot contain a top-ten result, in the block-max family. It is the more
-intrusive change and it is not written.
+With positions dealt with, the remaining cost was scoring — and most of it was
+not arithmetic. Phase one ran over every candidate and, for each, built an
+[`Explanation`]: a vector of per-term scores, each owning a **copy of the term
+string**. Two terms across 84,234 candidates is 168,468 string allocations, all
+but a hundred of them discarded. It also resolved the document's host
+authority per document rather than per host, which normalises a string and
+searches a map — 84,234 lookups for 500 answers.
 
-Note that the worst case has changed identity. At a million documents:
+Phase one now computes the score numerically and allocates nothing, and host
+standing is cached per host id. The same treatment applies to single-term
+queries, where the cut is *exact* rather than an approximation: with no
+proximity to add, a candidate's score is final, so keeping the best hundred and
+explaining only those cannot change what comes back.
+
+| case | before | after |
+|---|---|---|
+| commonest term | 17.0ms | **12.5ms** |
+| two common terms | 25.6ms | 24.3ms |
+| `site:` filter | 4.5ms | 5.9ms |
+
+Worth having, and much smaller than the first two changes. Two scoring paths
+now compute one number, which is exactly the duplication that drifts, so a test
+asserts they agree across a spread of inputs.
+
+**This is also where the benchmark earned its keep.** It runs every case twice,
+with and without the rescoring cut, and compares the pages. It reported that
+the cut had changed the results for `rare term` — and it had, because
+`select_nth_unstable` leaves the kept set in arbitrary order and the code that
+consumed it assumed document order. That check was added on the principle that
+an approximation nobody verifies is a bug with a good excuse. It caught a bug
+with no excuse at all, in a commit that was otherwise about speed.
+
+Chasing it turned up a second, older problem. The top-k heap admitted a hit
+only on a **strictly greater score**, while the final sort broke ties by
+document id. So when scores tied — which on a real corpus is constant — which
+of several equal-scoring documents survived depended on the order they happened
+to arrive in. Admission now uses the whole ordering, so the result is a
+function of the corpus rather than of the traversal.
+
+### What is left, and why the textbook answer does not apply
+
+At a million documents, projecting linearly:
 
 | case | projected |
 |---|---|
-| phrase over two common terms | ~620ms |
-| two common terms | ~265ms |
-| commonest term | ~170ms |
+| phrase over two common terms | ~650ms |
+| two common terms | ~280ms |
+| commonest term | ~125ms |
 | everything else | under 60ms |
 
-The phrase is now the binding case, and it is the one that pruning helps least,
-because its candidate set is not a ranking artefact — it is the answer.
+The obvious next step is **top-k pruning** — block-max WAND and its relatives —
+which stores a maximum score per block of postings so the traversal can skip
+blocks that cannot contain a result. I had it named here as the remaining fix.
+Having measured, I do not think it helps either of the two cases above, and it
+is worth writing down why rather than building it and finding out.
+
+**Pruning needs the score to be concentrated, and here it is not.** A term
+appearing in every document has an IDF of about 0.000005 — it contributes
+essentially nothing, because a word everyone uses tells you nothing about who
+to prefer. For `leck braick`, one term contributes ~0 and the other at most
+0.17, while quality contributes up to 0.4 and authority up to 0.3. A block
+bound built from term frequencies is therefore dominated by terms that are not
+bounded per block at all, and it would sit far above the tenth-best score
+without ever excluding anything.
+
+**Bounding the static signals would need a corpus this repository does not
+have.** Quality is known at index time and could be stored per block; authority
+is computed afterwards and could not. And in the synthetic corpus every
+document has *identical* quality, so every block's bound would be identical and
+pruning would demonstrably do nothing — which means building it here would be
+building something that cannot be evaluated until there is a real crawl with
+real variation in it.
+
+**And the phrase case is not a pruning problem in the first place.** Whether a
+document contains the phrase is not a score to be bounded; it is whether the
+document matches. No bound lets you skip a block without knowing what is in it.
+
+So the honest position is: the remaining cost is what conjunctive matching over
+two terms that each appear in most of the corpus actually costs. The routes out
+are not pruning. They are to stop requiring such terms to be matched
+conjunctively at all — the classic treatment of stopwords, which §5.7 argued
+against for good reasons and which would need re-examining with this cost in
+hand — or to order the index by a static score so traversal can stop early,
+which changes the document ordering the intersection depends on. Both are
+larger decisions than an optimisation, and neither should be taken on a
+synthetic corpus.
 
 ### Where principle 4 actually stands
 
 | | promise | measured |
 |---|---|---|
 | Index size | "small on disk" | **met** — 29% of text with positions, 3,951 bytes per page, stable from 20k to 100k documents |
-| Latency, 100k documents | sub-200ms | **met**, worst case 62.4ms — under a third of the budget |
-| Latency, 1M documents | sub-200ms | **not met for two cases** — a phrase over two very common terms (~620ms) and two very common terms (~265ms). Everything else fits |
+| Latency, 100k documents | sub-200ms | **met**, worst case 65.0ms — under a third of the budget |
+| Latency, 1M documents | sub-200ms | **not met for two cases** — a phrase over two very common terms (~650ms) and two very common terms (~280ms). Everything else fits |
 
 The worst case is two *very* common terms — in this corpus the rank-1 term
 appears in every document, which is what "the" does in English. The engine
@@ -1235,15 +1303,18 @@ Two honest readings, and both belong here:
   and to about three million for every query that is not a phrase over two of
   the commonest words in the language.
 - **It still does not hold for those two cases at a million documents**, and
-  the change that would help most — top-k pruning — is named above and not
-  written.
+  the reason is not a missing optimisation. It is what an AND over two terms
+  that each appear in most of the corpus costs. The routes out are decisions
+  about stopwords or about index ordering, not a faster loop.
 
 The worst case went 176ms to 98.5ms to 26.5ms, and the common cases 88.8ms to
-17.0ms, in three steps that each came from measuring first and changing second.
-Two of the three were not what I would have guessed: the codec was not the
-lever in §6, and skip groups were worth twice what I costed them at here. The
-benchmark that only reports the cases that pass would have been easier to write
-and worth nothing.
+12.5ms, in three steps that each came from measuring first and changing second.
+None of the three was what I would have guessed: the codec was not the lever in
+§6, skip groups were worth twice what I costed them at, and the last step's
+biggest single cost turned out to be string allocations in a code path whose
+output was discarded. The fourth step, the one everybody names, turns out not
+to apply at all. A benchmark that only reported the cases that pass would have
+been easier to write and worth nothing.
 
 ---
 

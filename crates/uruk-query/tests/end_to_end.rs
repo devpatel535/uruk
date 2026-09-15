@@ -462,3 +462,134 @@ fn the_rescoring_cut_does_not_change_the_results_it_returns() {
         }
     }
 }
+
+/// A corpus of identical pages, so every score ties.
+///
+/// Ties are where a selection and a sort disagree if they do not use the same
+/// order, and real corpora produce them constantly: any two pages with the
+/// same words in the same proportions score the same.
+fn tied_corpus(name: &str, pages: usize, docs_per_segment: usize) -> Searchable {
+    let root = std::env::temp_dir().join(format!("uruk-e2e-tied-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let crawl_dir = root.join("crawl");
+    let index_dir = root.join("index");
+
+    let mut writer = StoreWriter::create(&crawl_dir).unwrap();
+    for i in 0..pages {
+        writer
+            .push(&Record {
+                url: format!("https://tied.test/page/{i}"),
+                final_url: format!("https://tied.test/page/{i}"),
+                fetched_at: 0,
+                status: 200,
+                depth: 1,
+                fingerprint: i as u64,
+                title: String::from("Clay tablets"),
+                text: String::from("Clay tablets from Uruk record barley rations in cuneiform."),
+                headings: vec![String::from("Clay tablets")],
+                lang: Some(String::from("en")),
+                links: Vec::new(),
+                quality: QualitySignals {
+                    text_ratio: 0.45,
+                    link_density: 0.05,
+                    scripts: 1,
+                    words: 9,
+                },
+                snippet_allowed: true,
+                max_snippet: None,
+            })
+            .unwrap();
+    }
+    writer.finish(&CrawlSummary::default()).unwrap();
+
+    build(&IndexConfig {
+        crawl_dir: crawl_dir.clone(),
+        out_dir: index_dir.clone(),
+        docs_per_segment,
+        progress: false,
+    })
+    .unwrap();
+
+    Searchable {
+        index: Index::open(&index_dir).unwrap(),
+        crawl_dir,
+    }
+}
+
+#[test]
+fn tied_scores_rank_by_the_rule_and_not_by_arrival_order() {
+    // The ranking rule says: best score first, ties to the lower document id.
+    // If the top-k heap admits only on a strictly better score, a hit that
+    // ties with the current worst is turned away — so which of several
+    // equal-scoring documents survives depends on the order they arrive in,
+    // which depends on how the index happens to be segmented.
+    //
+    // Every page here scores identically, so the answer is entirely decided
+    // by the tie-break, and the segmentation is varied to change arrival
+    // order without changing the corpus. The result must not move.
+    let mut expected: Option<Vec<u32>> = None;
+    for docs_per_segment in [500, 64, 32, 7] {
+        let mut engine = tied_corpus(&format!("arrival{docs_per_segment}"), 200, docs_per_segment);
+        let page: Vec<u32> = engine
+            .run("clay tablets")
+            .hits
+            .iter()
+            .map(|hit| hit.crawl_doc)
+            .collect();
+        assert_eq!(page.len(), 10);
+        match &expected {
+            None => expected = Some(page),
+            Some(first) => assert_eq!(
+                &page, first,
+                "segmenting at {docs_per_segment} changed which tied documents won"
+            ),
+        }
+    }
+    // And the rule itself: with everything tied, the lowest document ids win.
+    assert_eq!(expected.unwrap(), (0..10).collect::<Vec<u32>>());
+}
+
+#[test]
+fn the_rescoring_cut_survives_a_corpus_where_everything_ties() {
+    // The case that caught a real bug. When every candidate scores the same,
+    // which hundred the cut keeps is decided entirely by the tie-break — and
+    // if that differs from the tie-break the final ranking uses, the page
+    // changes depending on whether the cut is enabled. It did, for one commit.
+    //
+    // Two hundred identical pages against a cut of twelve, so the cut bites
+    // hard and every decision it makes is a tie.
+    let mut engine = tied_corpus("ties", 200, 1000);
+
+    for query in [
+        "clay",
+        "clay tablets",
+        "\"clay tablets\"",
+        "tablets -mesopotamia",
+    ] {
+        let query_parsed = parse::parse(query);
+        let cut = SearchOptions {
+            limit: 10,
+            rescore_depth: Some(12),
+            ..SearchOptions::default()
+        };
+        let exact = SearchOptions {
+            limit: 10,
+            rescore_depth: None,
+            ..SearchOptions::default()
+        };
+
+        let with_cut = search(&mut engine.index, &query_parsed, &cut).expect("search");
+        let without = search(&mut engine.index, &query_parsed, &exact).expect("search");
+
+        let a: Vec<u32> = with_cut.hits.iter().map(|h| h.crawl_doc).collect();
+        let b: Vec<u32> = without.hits.iter().map(|h| h.crawl_doc).collect();
+        assert_eq!(
+            a, b,
+            "the cut changed the page for {query:?} on an all-ties corpus"
+        );
+        assert_eq!(
+            with_cut.matched, without.matched,
+            "match count for {query:?}"
+        );
+    }
+}

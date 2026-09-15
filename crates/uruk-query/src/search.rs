@@ -367,6 +367,7 @@ fn with_positions(
     };
 
     // --- phase one: everything except proximity ---
+    let mut standing = HostStanding::default();
     let mut scored: Vec<Candidate> = Vec::new();
     for (at, (doc, indices)) in candidates.iter().enumerate() {
         let Some(entry) = keep(index, segment, *doc, &excluded, pass.host_filter) else {
@@ -385,9 +386,18 @@ fn with_positions(
             .zip(&documents)
             .map(|(&index, list): (&usize, &&[DocPosting])| list[index].counts)
             .collect();
-        let without = build_hit(index, segment, *doc, &entry, pass, &counts, None);
+        // The score alone. Building an explanation here would allocate a
+        // vector of owned term strings for every candidate, and all but a
+        // hundred of them are about to be discarded.
+        let score = pass.scorer.score_without_proximity(
+            pass.frequencies,
+            &counts,
+            entry.lengths,
+            entry.quality,
+            standing.get(index, segment, entry.host, pass.authority),
+        );
         scored.push(Candidate {
-            score: without.score,
+            score,
             doc: *doc,
             entry,
             counts,
@@ -404,7 +414,7 @@ fn with_positions(
         // `select_nth_unstable` partitions in linear time rather than sorting:
         // the order within the kept set does not matter, because every one of
         // them is about to be rescored and re-ranked anyway.
-        scored.select_nth_unstable_by(depth, |a, b| b.score.total_cmp(&a.score));
+        scored.select_nth_unstable_by(depth, |a, b| by_rank((a.score, a.doc), (b.score, b.doc)));
         scored.truncate(depth);
     }
     // Back into document order, which is also ascending order in every
@@ -426,16 +436,72 @@ fn with_positions(
     for (candidate, positions) in scored.iter().zip(&positions) {
         let span = closest_span(&positions.iter().collect::<Vec<_>>());
         hits.push(build_hit(
-            index,
             segment,
             candidate.doc,
             &candidate.entry,
             pass,
             &candidate.counts,
             span,
+            standing.get(index, segment, candidate.entry.host, pass.authority),
         ));
     }
     Ok((hits, matched))
+}
+
+/// The order a segment's candidates are cut in: best score first, ties to the
+/// lower document id.
+///
+/// It has to be *the same* total order the final heap uses. It was not, for
+/// one commit: the cut partitioned by score alone and broke ties arbitrarily,
+/// so when many documents scored identically the hundred it kept were not the
+/// hundred the final ordering would have chosen, and a single-term query
+/// returned a different page depending on whether the cut was enabled.
+///
+/// `query_bench` caught it, because it runs every case both ways and compares
+/// the pages. That check was added on the principle that an approximation
+/// nobody verifies is a bug with a good excuse; it turned out to catch a bug
+/// with no excuse at all.
+fn by_rank(left: (f64, u32), right: (f64, u32)) -> std::cmp::Ordering {
+    right
+        .0
+        .total_cmp(&left.0)
+        .then_with(|| left.1.cmp(&right.1))
+}
+
+/// A host's authority, looked up once per host rather than once per document.
+///
+/// Resolving a host's standing means turning a host id into a name and then
+/// that name into a score, which normalises the string and searches a map. On
+/// a corpus of 500 hosts and 84,234 candidates that is 84,234 lookups for 500
+/// answers, and it was measurable.
+#[derive(Default)]
+struct HostStanding {
+    /// Indexed by host id within the segment.
+    known: Vec<Option<f64>>,
+}
+
+impl HostStanding {
+    fn get(
+        &mut self,
+        index: &Index,
+        segment: u16,
+        host: u32,
+        authority: Option<&Authority>,
+    ) -> Option<f64> {
+        let table = authority?;
+        let at = host as usize;
+        if at >= self.known.len() {
+            self.known.resize(at + 1, None);
+        }
+        if let Some(score) = self.known[at] {
+            return Some(score);
+        }
+        let score = index
+            .host_name_of(segment, host)
+            .map_or(0.0, |name| table.score(name));
+        self.known[at] = Some(score);
+        Some(score)
+    }
 }
 
 /// A document that matched, carried between the two scoring phases.
@@ -509,15 +575,51 @@ fn without_positions(
     let (excluded, exclusion_reads) = excluded_docs(index, segment, pass.query)?;
     *lists_read += exclusion_reads;
 
-    let mut hits = Vec::new();
+    // The same two phases as `with_positions`, and here the cut is *exact*
+    // rather than an approximation: with no proximity to add, a candidate's
+    // score is final, so keeping the best `depth` and explaining only those
+    // cannot change which documents come back. A single common term matches
+    // a hundred thousand documents and returns ten; building an explanation
+    // for all of them was the same waste in a place where it costs nothing to
+    // avoid.
+    let mut standing = HostStanding::default();
+    let mut scored: Vec<(f64, u32, DocEntry, Vec<FieldCounts>)> = Vec::new();
     for (doc, postings) in candidates {
         let Some(entry) = keep(index, segment, doc, &excluded, pass.host_filter) else {
             continue;
         };
         let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
-        hits.push(build_hit(index, segment, doc, &entry, pass, &counts, None));
+        let score = pass.scorer.score_without_proximity(
+            pass.frequencies,
+            &counts,
+            entry.lengths,
+            entry.quality,
+            standing.get(index, segment, entry.host, pass.authority),
+        );
+        scored.push((score, doc, entry, counts));
     }
-    let matched = hits.len();
+    let matched = scored.len();
+
+    if let Some(depth) = pass.depth
+        && scored.len() > depth
+    {
+        scored.select_nth_unstable_by(depth, |a, b| by_rank((a.0, a.1), (b.0, b.1)));
+        scored.truncate(depth);
+    }
+
+    // Back into document order: `select_nth_unstable` leaves the kept set in
+    // no particular order, and a defined order is worth more than the
+    // microseconds it costs — it keeps what this function returns a function
+    // of the corpus rather than of the partitioning.
+    scored.sort_unstable_by_key(|(_, doc, _, _)| *doc);
+
+    let mut hits = Vec::with_capacity(scored.len());
+    for (_, doc, entry, counts) in scored {
+        let standing = standing.get(index, segment, entry.host, pass.authority);
+        hits.push(build_hit(
+            segment, doc, &entry, pass, &counts, None, standing,
+        ));
+    }
     Ok((hits, matched))
 }
 
@@ -544,13 +646,13 @@ fn keep(
 
 /// Score one matched document, with or without its proximity.
 fn build_hit(
-    index: &Index,
     segment: u16,
     doc: u32,
     entry: &DocEntry,
     pass: &Pass<'_>,
     counts: &[FieldCounts],
     span: Option<u32>,
+    standing: Option<f64>,
 ) -> Hit {
     let contributions: Vec<TermScore> = counts
         .iter()
@@ -558,15 +660,6 @@ fn build_hit(
         .zip(pass.frequencies)
         .map(|((counts, name), &df)| pass.scorer.term(name, df, *counts, entry.lengths))
         .collect();
-
-    // Authority is a property of the host, so it is looked up once per
-    // document rather than per term, and only for documents that survived
-    // every filter above.
-    let standing = pass.authority.map(|table| {
-        index
-            .host_name(DocRef { segment, doc })
-            .map_or(0.0, |host| table.score(host))
-    });
     let explanation = pass
         .scorer
         .document(contributions, entry.quality, span, standing);

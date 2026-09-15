@@ -50,11 +50,12 @@ Named here rather than discovered later. Each has a section in `RESEARCH.md`
 explaining the reasoning, and none of them is a to-do that was forgotten.
 
 - **Sub-200ms at a million pages, for two query shapes.** The budget holds to
-  roughly 300,000 documents (worst case 62.4ms, measured), and to about three
+  roughly 300,000 documents (worst case 65.0ms, measured), and to about three
   million for anything that is not a phrase over two extremely common words.
-  Top-k pruning is what would close the rest;
+  What is left is not a missing optimisation but what an AND over two
+  near-universal terms costs;
   [§6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
-  has the projection.
+  sets out why block-max pruning does not help and what would.
 - **A real judged query set.** The harness exists; the judgments are a human
   judgement about a specific corpus and cannot be generated. See
   `crates/uruk-eval/examples/judgments.example.txt`.
@@ -150,7 +151,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 380 tests
+cargo test --workspace          # 382 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -170,13 +171,14 @@ proximity intact. Both numbers print on every run, so a change that makes the
 index fatter is visible immediately.
 
 `query_bench` measures the other half of principle 4. At 100,000 documents
-every case is inside the 200ms budget with the worst at **62.4ms**, down from
+every case is inside the 200ms budget with the worst at **65.0ms**, down from
 176ms when it was first measured. The work is linear in corpus size, so the
 budget holds to roughly 300,000 documents — and to about three million for
 every query that is not a phrase over two of the commonest words in the
 language. [RESEARCH.md
 §6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
-has the breakdown, the three fixes so far, and the one still outstanding.
+has the breakdown, the three fixes, and why the fourth one everybody names —
+block-max pruning — turns out not to apply to what is left.
 
 ## Running your own
 

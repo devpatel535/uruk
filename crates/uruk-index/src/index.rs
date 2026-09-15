@@ -212,6 +212,16 @@ impl Index {
         self.segments.get(segment as usize)?.host_id(host)
     }
 
+    /// A host's name within one segment, by the id the document table holds.
+    ///
+    /// Separate from [`Self::host_name`] because scoring wants to look a host
+    /// up once and reuse it: many documents share a host, and resolving the
+    /// name through a document reference each time turns a per-host cost into
+    /// a per-candidate one.
+    pub fn host_name_of(&self, segment: u16, host: u32) -> Option<&str> {
+        self.segments.get(segment as usize)?.host_name(host)
+    }
+
     /// A document's host name, for display.
     pub fn host_name(&self, reference: DocRef) -> Option<&str> {
         let reader = self.segments.get(reference.segment as usize)?;
