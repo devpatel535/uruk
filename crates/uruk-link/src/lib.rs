@@ -20,6 +20,7 @@
 pub mod authority;
 pub mod graph;
 pub mod host;
+pub mod suffix;
 
 pub use authority::{Authority, Method};
 pub use graph::HostGraph;

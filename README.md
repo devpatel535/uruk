@@ -64,10 +64,6 @@ explaining the reasoning, and none of them is a to-do that was forgotten.
   argument stands: add it with a way to measure whether it helped.
 - **Segment merging.** An index is written as segments and they are never
   merged, so a query reads every segment's dictionary.
-- **A public suffix list**, for deciding when two hosts are the same site.
-  The current approximation errs towards discarding votes rather than
-  inventing them, which is the safe direction, and there is a test pinning the
-  cases it gets wrong.
 - **Rate limiting.** Discussed in [DEPLOYING.md](DEPLOYING.md); the honest
   options all trade against the privacy promise, so it is an operator's
   decision rather than a default.
@@ -128,7 +124,9 @@ Claims worth being precise about, each of which has a test:
 - Every result can show its per-signal score breakdown (`uruk search
   --explain`), and a test asserts the parts sum exactly to the score.
 - A host linking to another host counts **once**, however many pages it uses,
-  and a site cannot vote for itself. A fixture where a sixteen-page link farm
+  and a site cannot vote for itself — with "site" decided by the Public Suffix
+  List, so `example.co.uk` is a site and two projects on one hosting service
+  can vouch for each other. A fixture where a sixteen-page link farm
   is 84% of the corpus scores that farm zero.
 - A ranking change is measured, not argued about — and `uruk eval` refuses to
   call a difference significant on too few queries, however large it is.
@@ -151,7 +149,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 382 tests
+cargo test --workspace          # 394 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

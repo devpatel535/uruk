@@ -31,45 +31,26 @@ pub fn node(url: &str) -> Option<String> {
     Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
 }
 
-/// The last two labels of a host: an approximation of "the same site".
+/// The registrable domain of a host: the unit of "the same site".
 ///
 /// `blog.example.com` and `shop.example.com` both reduce to `example.com`, so
-/// a link between them is recognised as a site linking to itself and does not
-/// pass authority.
+/// a link between them is a site linking to itself and passes no authority.
 ///
-/// # This is an approximation, and it is wrong in a known direction
+/// # This used to be an approximation, and it was wrong in a known direction
 ///
-/// The correct tool is the Public Suffix List, which knows that `example.co.uk`
-/// is a site while `co.uk` is not, and that every `*.github.io` is a *different*
-/// site despite sharing two labels.
+/// It was "the last two labels", which is wrong twice over: it made two
+/// unrelated British sites (`a.example.co.uk`, `b.other.co.uk`) look like one,
+/// and two unrelated projects on a hosting service (`alice.github.io`,
+/// `bob.github.io`) look like one. Both errors discarded votes that should
+/// have counted — never inventing one — which was the safe direction but still
+/// a weaker signal than the evidence supported.
 ///
-/// Without it this function makes two mistakes:
-///
-/// - `a.example.co.uk` and `b.other.co.uk` both reduce to `co.uk`, so links
-///   between unrelated British sites are discarded as self-links.
-/// - `alice.github.io` and `bob.github.io` reduce to `github.io`, so one
-///   genuinely cannot vote for the other.
-///
-/// Both mistakes **discard votes that should have counted**. None of them
-/// *creates* a vote. That asymmetry is deliberate: an authority signal that
-/// undercounts is a weaker signal, while one that overcounts is an attack
-/// surface, and this is the signal spam attacks hardest (`RESEARCH.md` §5.3).
-///
-/// Adopting a real public suffix list is the fix, and it is a data file plus a
-/// lookup rather than a redesign. It is not done here because the list has to
-/// be shipped, kept current, and licensed, which is a decision rather than a
-/// detail.
+/// It now consults the Public Suffix List, which is the only way to know that
+/// `co.uk` is a registry and `github.io` is one too. See [`crate::suffix`] for
+/// how the rules work and `data/README.md` for where the list comes from and
+/// what licence it carries.
 pub fn site(host: &str) -> &str {
-    let mut labels = host.rsplitn(3, '.');
-    let Some(last) = labels.next() else {
-        return host;
-    };
-    let Some(second) = labels.next() else {
-        return host;
-    };
-    // `second.last` is the tail; find where it starts in the original.
-    let start = host.len() - (second.len() + 1 + last.len());
-    &host[start..]
+    crate::suffix::registrable_domain(host)
 }
 
 /// Whether a link from `from` to `to` is a site linking to itself.
@@ -129,12 +110,24 @@ mod tests {
     }
 
     #[test]
-    fn the_known_approximation_errs_towards_discarding_votes() {
-        // Documented in `site`: without a public suffix list these look like
-        // one site. The test exists so the limitation is visible rather than
-        // discovered, and so that adopting a real list has a failing test to
-        // flip.
-        assert!(same_site("alice.github.io", "bob.github.io"));
-        assert!(same_site("a.example.co.uk", "b.other.co.uk"));
+    fn addresses_are_each_their_own_site() {
+        // Two machines on a subnet are not one site, and the fixture crawls in
+        // this repository depend on that being true.
+        assert!(!same_site("127.0.0.2", "127.0.0.3"));
+        assert!(same_site("127.0.0.2", "127.0.0.2"));
+    }
+
+    #[test]
+    fn the_cases_the_old_approximation_got_wrong_are_now_right() {
+        // This test used to assert the opposite, as a record of what the
+        // two-label approximation could not do. The Public Suffix List is
+        // what flipped it: two projects on a hosting service can now vouch
+        // for each other, and two unrelated British sites are no longer one.
+        assert!(!same_site("alice.github.io", "bob.github.io"));
+        assert!(!same_site("a.example.co.uk", "b.other.co.uk"));
+
+        // And the thing it was protecting against still holds.
+        assert!(same_site("a.example.co.uk", "b.example.co.uk"));
+        assert!(same_site("docs.alice.github.io", "blog.alice.github.io"));
     }
 }
