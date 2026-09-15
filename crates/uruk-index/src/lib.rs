@@ -5,9 +5,11 @@
 //! and 12". That flip is the reason a search takes milliseconds instead of
 //! reading every document.
 
+pub mod anchors;
 pub mod build;
 pub mod codec;
 pub mod fields;
+pub mod host;
 pub mod index;
 pub mod merge;
 pub mod postings;

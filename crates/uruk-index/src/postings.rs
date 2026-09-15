@@ -600,7 +600,7 @@ mod tests {
         Codec, POSITION_GROUP, Posting, STREAM, decode, decode_list, encode, read_varint,
         write_varint,
     };
-    use crate::fields::Field;
+    use crate::fields::{FIELD_COUNT, Field};
 
     fn round_trip_varint(value: u64) {
         let mut buffer = Vec::new();
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn absent_fields_cost_nothing() {
-        // A term only in the body should not pay for three zero counts.
+        // A term only in the body should not pay for the other fields' zeros.
         let mut body_only = Posting::new(0);
         body_only.counts.set(Field::Body, 1);
         body_only.positions = vec![4];
@@ -727,8 +727,12 @@ mod tests {
         for field in Field::ALL {
             all_fields.counts.set(field, 1);
         }
-        // One position per counted occurrence, as the invariant requires.
-        all_fields.positions = vec![4, 1_004, 2_004, 3_004];
+        // One position per counted occurrence, as the invariant requires, one
+        // per field. Derived from FIELD_COUNT so that adding a field does not
+        // quietly turn this into a test of something else.
+        all_fields.positions = (0..FIELD_COUNT)
+            .map(|field| u32::try_from(field).expect("fits") * 1_000 + 4)
+            .collect();
 
         let (mut lean, mut fat) = (Vec::new(), Vec::new());
         encode(std::slice::from_ref(&body_only), &mut lean);

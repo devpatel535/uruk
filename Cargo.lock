@@ -1778,6 +1778,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uruk-crawl",
+ "uruk-link",
 ]
 
 [[package]]

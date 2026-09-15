@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uruk_crawl::store::{StoreError, StoreReader};
 
+use crate::anchors::Anchors;
 use crate::segment::{DocQuality, Document, SegmentBuilder, SegmentError, SegmentManifest};
 
 /// Documents per segment.
@@ -116,6 +117,26 @@ pub fn build(config: &IndexConfig) -> Result<IndexManifest, IndexError> {
     let mut store = StoreReader::open(&config.crawl_dir)?;
     std::fs::create_dir_all(&config.out_dir)?;
 
+    // A pass over the crawl before any document is indexed, because anchor
+    // text is a property of the corpus rather than of a page: what a page is
+    // called is decided by everything that links to it.
+    if config.progress {
+        eprintln!("uruk-index: gathering anchor text...");
+    }
+    let anchors = Anchors::collect(&mut store)?;
+    if config.progress {
+        eprintln!(
+            "uruk-index: {} documents described by other sites \
+             ({} links, {} same-site, {} repeats, {} nofollow, {} over-long)",
+            anchors.described(),
+            anchors.links_seen,
+            anchors.same_site,
+            anchors.repeated,
+            anchors.nofollow,
+            anchors.too_long
+        );
+    }
+
     let mut manifest = IndexManifest::default();
     let mut builder = SegmentBuilder::new();
 
@@ -135,6 +156,7 @@ pub fn build(config: &IndexConfig) -> Result<IndexManifest, IndexError> {
         }
 
         manifest.text_bytes += record.text.len() as u64;
+        let anchor = anchors.text_for(&record.url, &record.final_url);
         builder.add(&Document {
             crawl_doc: id,
             url: &record.url,
@@ -142,6 +164,7 @@ pub fn build(config: &IndexConfig) -> Result<IndexManifest, IndexError> {
             headings: &record.headings,
             body: &record.text,
             host: host_of(&record.url),
+            anchor: &anchor,
             quality: DocQuality {
                 #[expect(clippy::cast_possible_truncation, reason = "f64 to f32 for storage")]
                 text_ratio: record.quality.text_ratio as f32,

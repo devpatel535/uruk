@@ -118,6 +118,7 @@ enum SignalArg {
     Authority,
     Proximity,
     Quality,
+    Anchor,
 }
 
 impl From<SignalArg> for Signal {
@@ -126,6 +127,7 @@ impl From<SignalArg> for Signal {
             SignalArg::Authority => Self::Authority,
             SignalArg::Proximity => Self::Proximity,
             SignalArg::Quality => Self::Quality,
+            SignalArg::Anchor => Self::Anchor,
         }
     }
 }

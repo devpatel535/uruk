@@ -540,11 +540,46 @@ surface — and there is a test pinning the known-wrong cases so that adopting a
 real suffix list has a failing test to flip. Shipping the list is a licensing
 and update-cadence decision, not a code change.
 
-**Still not done, and deliberately:** anchor text as an index field. The link
-graph now makes it available — anchors are stored per edge — but adding a
-fifth field changes the segment format again, and §5.4's argument stands: it
-should be added with a judged query set in place to measure whether it helps,
-not before.
+#### Anchor text, added on the condition that it could be measured
+
+The link graph made anchor text available, and §5.4's argument said not to add
+it until there was a way to tell whether it helped. `uruk eval --without
+anchor` is that way, so it is now a fifth field (format version 5).
+
+It earns its place because **a page often does not contain the words people use
+to look for it.** A university's admissions page may never say "how to apply";
+the hundred pages linking to it do. That is information the page cannot
+provide about itself, and there is a test that builds exactly that case — a
+page that never uses the phrase, findable by it anyway, including as a quoted
+phrase, because anchor text gets positions like every other field.
+
+It is also the easiest field in the index to attack, so most of the code is
+about what does *not* count:
+
+| Discarded | Why |
+|---|---|
+| A site's own links | Navigation is not other people describing you. Same-site by registrable domain, the same rule the link graph uses. |
+| Repeats from one host | A sitewide footer link is one host's opinion, however many pages carry it. Each distinct phrase counts once per source site. |
+| `rel="nofollow"` | The author declined to vouch. |
+| Phrases over 80 characters | A paragraph wrapped in a link is not what anybody calls the page. |
+| Anything past 12 phrases or 400 characters per page | A memory bound and a spam bound at once. |
+
+Each of those has a test that tries the abuse and checks it fails, including
+one where a forty-page farm shouts twenty phrases at a target and an honest
+describer still gets through.
+
+**Its weight is 2.5**, between title (3.0) and heading (2.0). The literature
+puts anchor text higher — it is often the strongest single field — and it is
+also the field most worth attacking, which is an argument for starting below
+where the reading suggests rather than above. Like every number in the scorer
+it is a guess, and now a measurable one.
+
+**What it costs is not yet known**, and that is worth saying rather than
+filling in. The synthetic corpus `index_size` uses has no links at all, so it
+measures the anchor field at zero — the only honest thing to report from it is
+the bound: at most 400 characters (~60 tokens) per described page, against
+800-word bodies, so under 8% more postings for pages other sites actually link
+to and nothing for the rest. The real figure needs a real crawl.
 
 ### 5.4 No click data means curation is the product
 

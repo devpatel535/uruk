@@ -60,9 +60,6 @@ explaining the reasoning, and none of them is a to-do that was forgotten.
 - **A real judged query set.** The harness exists; the judgments are a human
   judgement about a specific corpus and cannot be generated. See
   `crates/uruk-eval/examples/judgments.example.txt`.
-- **Anchor text as an index field.** The link graph now stores anchors, so it
-  is available — but adding a field changes the segment format, and §5.4's
-  argument stands: add it with a way to measure whether it helped.
 
 ## Principles
 
@@ -129,6 +126,9 @@ Claims worth being precise about, each of which has a test:
 - The engine's one deliberate approximation — scoring proximity for the best
   hundred candidates rather than all of them — is checked by running both and
   comparing the results, not asserted.
+- A page can be found by what other sites call it, and not by what its own
+  site calls it: same-site anchors, repeats from one host, `nofollow` links and
+  over-long link text are all discarded, each with a test that tries the abuse.
 - A merged index answers identically to the one it came from — same results,
   same order, same scores — which is asserted directly rather than by
   comparing files.
@@ -151,7 +151,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 398 tests
+cargo test --workspace          # 407 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

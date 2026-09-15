@@ -47,7 +47,11 @@ const fn default_b(field: Field) -> f64 {
     match field {
         Field::Body => 0.75,
         Field::Heading => 0.5,
-        Field::Title | Field::Url => 0.3,
+        // Anchor text is a bag of short phrases from different people. Its
+        // "length" is how many independent sites bothered to describe the
+        // page, which is closer to evidence than to dilution, so it is
+        // normalised barely at all.
+        Field::Title | Field::Url | Field::Anchor => 0.3,
     }
 }
 

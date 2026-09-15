@@ -11,11 +11,6 @@
 //! decides what they are worth.
 
 /// The fields a term can appear in.
-///
-/// Anchor text is deliberately absent. It belongs to the *target* of a link
-/// rather than the page it appears on, so collecting it needs the link graph,
-/// which is Phase 6. Adding a variant here later costs a segment format
-/// version bump and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Field {
@@ -27,20 +22,35 @@ pub enum Field {
     Heading = 2,
     /// Words in the URL itself.
     Url = 3,
+    /// What other people call this page: the text of links pointing at it.
+    ///
+    /// The one field whose content does not come from the page. A page about
+    /// a thing often does not use the words people use to look for it, and the
+    /// pages linking to it usually do — which is why anchor text has been a
+    /// strong signal since it was first used, and why it is also the field
+    /// most worth attacking. `crate::anchors` sets out what is counted and
+    /// what is thrown away.
+    Anchor = 4,
 }
 
 /// Number of fields. Also the width of the bitmask in an encoded posting, so
 /// it must stay at or below 8 without widening that mask.
-pub const FIELD_COUNT: usize = 4;
+pub const FIELD_COUNT: usize = 5;
 
-// The encoder writes the field mask as a single byte. Adding a fifth, sixth,
-// seventh or eighth field is free; a ninth silently would not fit, so fail the
-// build instead.
+// The encoder writes the field mask as a single byte. A sixth, seventh or
+// eighth field is free; a ninth silently would not fit, so fail the build
+// instead.
 const _: () = assert!(FIELD_COUNT <= 8);
 
 impl Field {
     /// Every field, in storage order.
-    pub const ALL: [Self; FIELD_COUNT] = [Self::Body, Self::Title, Self::Heading, Self::Url];
+    pub const ALL: [Self; FIELD_COUNT] = [
+        Self::Body,
+        Self::Title,
+        Self::Heading,
+        Self::Url,
+        Self::Anchor,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -57,6 +67,7 @@ impl Field {
             Self::Title => "title",
             Self::Heading => "heading",
             Self::Url => "url",
+            Self::Anchor => "anchor",
         }
     }
 }
@@ -126,9 +137,18 @@ impl Default for FieldWeights {
     fn default() -> Self {
         // Title above headings above URL above body. The ordering is the
         // brief's; the magnitudes are guesses awaiting evidence.
+        //
+        // Anchor text sits between title and heading. The literature puts it
+        // higher — it is often the strongest single field, because it is other
+        // people describing a page rather than the page describing itself —
+        // and it is also the field easiest to attack, which is an argument for
+        // starting below where the reading suggests rather than above. Like
+        // every number here it is a guess, and `uruk eval --without anchor`
+        // is how it stops being one.
         let mut weights = [1.0; FIELD_COUNT];
         weights[Field::Body.index()] = 1.0;
         weights[Field::Title.index()] = 3.0;
+        weights[Field::Anchor.index()] = 2.5;
         weights[Field::Heading.index()] = 2.0;
         weights[Field::Url.index()] = 1.5;
         Self(weights)

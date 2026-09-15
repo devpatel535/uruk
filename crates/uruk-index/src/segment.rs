@@ -84,7 +84,9 @@ const MAGIC: &[u8; 8] = b"URUKIDX1";
 /// - 4: positions cut into independently decodable groups with a byte-length
 ///   table, so a reader can fetch one document's positions without decoding
 ///   every position before it.
-const FORMAT_VERSION: u32 = 4;
+/// - 5: anchor text added as a fifth field, which changes the width of every
+///   field count, length and mask in the format.
+const FORMAT_VERSION: u32 = 5;
 /// 4 section offsets + term count + 4 corpus totals + doc count + magic.
 const FOOTER_LEN: u64 = 8 * 5 + 8 * FIELD_COUNT as u64 + 4 + 8;
 
@@ -122,6 +124,9 @@ pub struct Document<'a> {
     pub body: &'a str,
     /// The host this page came from, for `site:` filtering.
     pub host: &'a str,
+    /// What other sites call this page: see [`crate::anchors`]. Empty when
+    /// nobody outside its own site links to it, which is most pages.
+    pub anchor: &'a str,
     pub quality: DocQuality,
 }
 
@@ -241,6 +246,7 @@ impl SegmentBuilder {
             (Field::Title, tokenize::tokenize(document.title)),
             (Field::Heading, tokenize::tokenize(&headings)),
             (Field::Url, tokenize::tokenize_url(document.url)),
+            (Field::Anchor, tokenize::tokenize(document.anchor)),
         ];
 
         // Fields share one position space so that a phrase can match inside
@@ -966,6 +972,7 @@ mod tests {
                 headings: &headings,
                 body: &body,
                 host: url.split('/').nth(2).unwrap_or_default(),
+                anchor: "",
                 quality: DocQuality {
                     text_ratio: 0.4,
                     link_density: 0.1,
@@ -1104,6 +1111,7 @@ mod tests {
             headings: &[],
             body: &body,
             host: "a.test",
+            anchor: "",
             quality: DocQuality::default(),
         });
         let manifest = builder.write(&path).unwrap();

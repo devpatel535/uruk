@@ -93,6 +93,10 @@ impl Configuration {
             Signal::Authority => variant.authority = None,
             Signal::Proximity => variant.weights.proximity = 0.0,
             Signal::Quality => variant.weights.quality = 0.0,
+            Signal::Anchor => variant
+                .weights
+                .fields
+                .set(uruk_index::fields::Field::Anchor, 0.0),
         }
         variant
     }
@@ -118,6 +122,9 @@ pub enum Signal {
     Authority,
     Proximity,
     Quality,
+    /// What other sites call a page. Added to the index on the condition that
+    /// its worth could be measured rather than asserted; this is that.
+    Anchor,
 }
 
 impl Signal {
@@ -126,10 +133,16 @@ impl Signal {
             Self::Authority => "authority",
             Self::Proximity => "proximity",
             Self::Quality => "quality",
+            Self::Anchor => "anchor text",
         }
     }
 
-    pub const ALL: [Self; 3] = [Self::Authority, Self::Proximity, Self::Quality];
+    pub const ALL: [Self; 4] = [
+        Self::Authority,
+        Self::Proximity,
+        Self::Quality,
+        Self::Anchor,
+    ];
 }
 
 /// Per-query scores plus their means.
