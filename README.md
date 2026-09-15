@@ -64,9 +64,6 @@ explaining the reasoning, and none of them is a to-do that was forgotten.
   argument stands: add it with a way to measure whether it helped.
 - **Segment merging.** An index is written as segments and they are never
   merged, so a query reads every segment's dictionary.
-- **Rate limiting.** Discussed in [DEPLOYING.md](DEPLOYING.md); the honest
-  options all trade against the privacy promise, so it is an operator's
-  decision rather than a default.
 
 ## Principles
 
@@ -133,6 +130,9 @@ Claims worth being precise about, each of which has a test:
 - The engine's one deliberate approximation — scoring proximity for the best
   hundred candidates rather than all of them — is checked by running both and
   comparing the results, not asserted.
+- The server sheds load rather than queueing it, and does so by counting
+  searches rather than searchers — there is no per-visitor state to rate-limit
+  against, deliberately.
 - The server writes no access log and no record of any query. A test runs the
   real binary, searches for a unique string, and fails if that string appears
   in anything the process wrote.
@@ -149,7 +149,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 394 tests
+cargo test --workspace          # 395 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

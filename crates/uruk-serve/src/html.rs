@@ -253,6 +253,23 @@ pub fn privacy() -> String {
     )
 }
 
+/// Too many searches at once.
+///
+/// Short, because it is served when the machine is already busy, and plain,
+/// because it is not the visitor's fault. It deliberately says nothing about
+/// *them* — no "you have made too many requests" — since the server counts
+/// searches and not searchers and has no basis for the accusation.
+pub fn busy() -> String {
+    page(
+        "Busy — uruk",
+        "<h1>Too many searches at once</h1>\n\
+         <p>This server is answering as many searches as it has agreed to \
+         answer at one time, so it is turning this one away rather than making \
+         everybody wait. Nothing is wrong and nothing was recorded.</p>\n\
+         <p>Try again in a moment.</p>",
+    )
+}
+
 /// Who our crawler is and how to stop it.
 ///
 /// `RESEARCH.md` §5.1 argues this page has to exist before the first fetch:

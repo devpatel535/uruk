@@ -21,6 +21,8 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Semaphore;
+
 use axum::Router;
 use axum::extract::{Query as QueryParams, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -35,6 +37,33 @@ use uruk_query::search::{SearchOptions, search};
 use uruk_query::snippet::{self, SnippetPolicy};
 
 use crate::html::{self, ResultRow};
+
+/// Searches allowed to be in flight at once, by default.
+///
+/// A search engine is a cheap thing to overload: every query reads posting
+/// lists off a disk, and nothing about answering one is free. Without a cap,
+/// enough simultaneous requests turn into an unbounded queue of work, and the
+/// machine spends its time being slow at everything instead of fast at the
+/// first few.
+///
+/// # Why a global cap and not a per-visitor one
+///
+/// The usual answer is to count requests per IP address. That needs a table
+/// keyed by who is asking, which is precisely the thing `/privacy` says does
+/// not exist — even held only in memory, it is per-person state about
+/// searching, and "we only keep it for sixty seconds" is a weaker promise than
+/// "there is nowhere to put it".
+///
+/// So this counts requests and not requesters. The trade is real and worth
+/// stating: one heavy user can consume the whole allowance, where a per-IP
+/// limit would have contained them. The engine cannot tell the difference
+/// between one impatient person and forty patient ones, and it has decided it
+/// would rather not be able to.
+///
+/// Eight, because searches serialise on the index lock anyway: the cap bounds
+/// how many requests wait for it, not how many run at once. `DEPLOYING.md`
+/// covers raising it and the proxy-level options.
+pub const DEFAULT_MAX_CONCURRENT_SEARCHES: usize = 8;
 
 /// Longest query we will act on.
 ///
@@ -56,6 +85,9 @@ struct Engine {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Mutex<Engine>>,
+    /// Permits for in-flight searches. Holds no information about who is
+    /// asking, only how many are asking.
+    searches: Arc<Semaphore>,
     user_agent: String,
     /// Show the per-signal score breakdown under each result.
     explain: bool,
@@ -82,6 +114,10 @@ pub struct ServeConfig {
     /// Show score breakdowns. Off by default: the brief's page is ten links.
     pub explain: bool,
     pub user_agent: String,
+    /// Searches in flight at once before the server sheds load. See
+    /// [`DEFAULT_MAX_CONCURRENT_SEARCHES`] for why it counts requests rather
+    /// than requesters.
+    pub max_concurrent_searches: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +159,7 @@ pub async fn run(config: &ServeConfig) -> Result<(), ServeError> {
 
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
+        searches: Arc::new(Semaphore::new(config.max_concurrent_searches.max(1))),
         user_agent: config.user_agent.clone(),
         explain: config.explain,
         results_per_page: config.results_per_page.max(1),
@@ -220,13 +257,39 @@ async fn search_page(
         return respond(StatusCode::OK, html::home(), false);
     }
 
+    // Shed load rather than queue it. `try_acquire` refuses immediately when
+    // the allowance is spent, so an overloaded server answers quickly and
+    // honestly instead of slowly and eventually — and the requests it does
+    // accept stay fast, which is the point of the budget in principle 4.
+    let Ok(permit) = Arc::clone(&state.searches).try_acquire_owned() else {
+        return busy();
+    };
+
     // Searching reads files. Doing that on a runtime thread would stall every
     // other request in flight.
-    let worker = tokio::task::spawn_blocking(move || run_search(&state, &raw));
+    let worker = tokio::task::spawn_blocking(move || {
+        let page = run_search(&state, &raw);
+        drop(permit);
+        page
+    });
     match worker.await {
         Ok(page) => respond(StatusCode::OK, page, false),
         Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR, html::not_found(), false),
     }
+}
+
+/// Too many searches at once.
+///
+/// `503` with a `Retry-After`, which is what the status is for: the service is
+/// fine and this request is not being served *now*. Deliberately not `429`,
+/// which means "you have asked too often" — a statement about the individual
+/// asking, which this server has no way to make and no wish to.
+fn busy() -> Response {
+    let mut response = respond(StatusCode::SERVICE_UNAVAILABLE, html::busy(), false);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+    response
 }
 
 /// The blocking half of a search: match, rank, and fetch what is displayed.
@@ -303,7 +366,7 @@ fn run_search(state: &AppState, raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUERY_LEN, ServeConfig};
+    use super::{DEFAULT_MAX_CONCURRENT_SEARCHES, MAX_QUERY_LEN, ServeConfig};
 
     #[test]
     fn a_query_longer_than_the_cap_is_truncated_not_rejected() {
@@ -332,11 +395,35 @@ mod tests {
             results_per_page: 10,
             explain: false,
             user_agent: "uruk-crawl/0.1".into(),
+            max_concurrent_searches: DEFAULT_MAX_CONCURRENT_SEARCHES,
         };
         assert_eq!(config.results_per_page, 10, "ten links is the product");
         assert!(
             !config.explain,
             "score breakdowns are not on the public page by default"
         );
+    }
+
+    #[test]
+    fn the_search_cap_counts_requests_and_not_requesters() {
+        // Not a behavioural test of the semaphore — a test of the promise.
+        // The state a rate limiter usually needs is a table keyed by who is
+        // asking, and this file must not grow one. If a future change adds
+        // per-visitor accounting, the privacy page's "not stored against an
+        // IP address" stops being true, and that should be a deliberate act
+        // rather than a detail in a performance commit.
+        // Everything above the test module, so the names being searched for
+        // do not match themselves.
+        let source = include_str!("server.rs");
+        let code = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        for accusation in ["remote_addr", "peer_addr", "ConnectInfo", "Forwarded-For"] {
+            assert!(
+                !code.contains(accusation),
+                "the server has started looking at who is asking: {accusation}"
+            );
+        }
+        const { assert!(DEFAULT_MAX_CONCURRENT_SEARCHES >= 1) };
     }
 }

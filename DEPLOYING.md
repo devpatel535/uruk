@@ -202,12 +202,30 @@ somewhere to write to, and the `/crawler` page needs to be true about you.
 inspectable, which is the main thing that separates a curated index from an
 opaque one. It also tells spammers exactly which doors to knock on.
 
-**Rate limiting.** Not built in. A search engine is a fairly cheap thing to
-overload — each query reads posting lists off disk — and the honest options are
-proxy-level limits, which need either an IP-keyed counter (state about
-visitors, if only in memory) or a global cap (no state, but one heavy user can
-starve everyone). A global concurrency cap at the proxy is the version that
-keeps the privacy promise intact.
+**Raising or lowering the search cap.** Built in, and on by default: the
+server answers **8 searches at once** and turns the rest away with a `503` and
+a `Retry-After`, rather than queueing work it cannot get to.
+
+It counts *requests*, not *requesters*. The usual rate limiter is keyed by IP
+address, which means a table of who is asking — precisely the thing `/privacy`
+says does not exist. "We only keep it for sixty seconds" is a weaker promise
+than "there is nowhere to put it".
+
+The trade is real and you should know it before you deploy: **one heavy user
+can consume the whole allowance**, where a per-IP limit would have contained
+them. The engine cannot tell one impatient person from forty patient ones, and
+it has been built so that it cannot.
+
+```sh
+uruk serve --max-concurrent-searches 16
+```
+
+Eight is a floor, not a tuned number: searches serialise on the index lock, so
+the cap bounds how many requests *wait* for it. Raise it if you have fast
+storage and see 503s under normal load; lower it if queries are slow and you
+would rather shed early. If you need something sharper than this, it belongs
+at the proxy, and putting it there is your decision about what you are willing
+to record.
 
 **Retention of nothing.** Worth checking, not assuming: no logs, no metrics
 with URIs in them, no error tracker that captures the request, no backup of a

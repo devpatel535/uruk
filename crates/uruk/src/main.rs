@@ -177,6 +177,15 @@ struct ServeArgs {
     /// default, because the product is ten links and nothing else.
     #[arg(short, long)]
     explain: bool,
+
+    /// Searches to answer at once before turning requests away with a 503.
+    ///
+    /// Counts requests, not requesters: a per-visitor limit would need a table
+    /// of who is asking, which is the thing the privacy page says does not
+    /// exist. One heavy user can therefore use the whole allowance; that
+    /// trade is deliberate and DEPLOYING.md explains it.
+    #[arg(long, default_value_t = server::DEFAULT_MAX_CONCURRENT_SEARCHES)]
+    max_concurrent_searches: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -293,6 +302,7 @@ fn run_serve(args: &ServeArgs) -> Result<(), String> {
         results_per_page: args.limit.max(1),
         explain: args.explain,
         user_agent: DEFAULT_USER_AGENT.to_owned(),
+        max_concurrent_searches: args.max_concurrent_searches.max(1),
     };
 
     let runtime = tokio::runtime::Runtime::new()
