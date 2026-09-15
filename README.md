@@ -16,6 +16,7 @@ from the command line or from a web page.
 ```sh
 uruk crawl  --seeds seeds.txt --out data/crawl --max-pages 1000
 uruk index  --crawl data/crawl --out data/index
+uruk merge  --index data/index --out data/index-merged
 uruk link   --crawl data/crawl --seeds seeds.txt
 uruk search --index data/index --crawl data/crawl "clay tablets"
 uruk eval   --judgments queries.txt --without authority
@@ -62,8 +63,6 @@ explaining the reasoning, and none of them is a to-do that was forgotten.
 - **Anchor text as an index field.** The link graph now stores anchors, so it
   is available — but adding a field changes the segment format, and §5.4's
   argument stands: add it with a way to measure whether it helped.
-- **Segment merging.** An index is written as segments and they are never
-  merged, so a query reads every segment's dictionary.
 
 ## Principles
 
@@ -93,7 +92,7 @@ the wrong design.
 |---|---|---|
 | CLI | `uruk` | One subcommand per component |
 | Crawler | `uruk-crawl` | Fetches politely, extracts text and links, stores compressed |
-| Indexer | `uruk-index` | Tokenises, builds `.uruk` segments, merges nothing yet |
+| Indexer | `uruk-index` | Tokenises, builds `.uruk` segments, merges them on request |
 | Link graph | `uruk-link` | Collapses links to hosts, scores authority, refuses to count self-votes |
 | Query engine | `uruk-query` | Matches, ranks with BM25F, explains every result |
 | Evaluation | `uruk-eval` | Judged queries, nDCG, and whether a change actually helped |
@@ -130,6 +129,9 @@ Claims worth being precise about, each of which has a test:
 - The engine's one deliberate approximation — scoring proximity for the best
   hundred candidates rather than all of them — is checked by running both and
   comparing the results, not asserted.
+- A merged index answers identically to the one it came from — same results,
+  same order, same scores — which is asserted directly rather than by
+  comparing files.
 - The server sheds load rather than queueing it, and does so by counting
   searches rather than searchers — there is no per-visitor state to rate-limit
   against, deliberately.
@@ -149,7 +151,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 395 tests
+cargo test --workspace          # 398 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

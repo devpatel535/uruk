@@ -18,6 +18,7 @@ use uruk_eval::metrics::{self, Summary};
 use uruk_eval::run::{Configuration, Signal, evaluate};
 use uruk_index::build::{self, IndexConfig};
 use uruk_index::index::Index;
+use uruk_index::merge;
 use uruk_link::authority::{self, Authority, Method, rank_correlation};
 use uruk_link::graph::HostGraph;
 use uruk_query::parse;
@@ -40,6 +41,8 @@ enum Command {
     Crawl(CrawlArgs),
     /// Turn a crawl into a searchable index.
     Index(IndexArgs),
+    /// Combine an index's segments, so a query reads fewer of them.
+    Merge(MergeArgs),
     /// Build the host link graph and score every host's authority.
     Link(LinkArgs),
     /// Score a ranking configuration against a judged query set.
@@ -48,6 +51,30 @@ enum Command {
     Search(SearchArgs),
     /// Serve the web front end.
     Serve(ServeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct MergeArgs {
+    /// Directory holding the index to merge.
+    #[arg(short, long, value_name = "DIR", default_value = "data/index")]
+    index: PathBuf,
+
+    /// Where to write the merged index.
+    ///
+    /// A separate directory on purpose: merging in place would leave the index
+    /// unreadable if it failed half-way, and an index costs too much to
+    /// rebuild for that to be a reasonable risk. Swap the directories
+    /// afterwards, as DEPLOYING.md describes for a refresh.
+    #[arg(short, long, value_name = "DIR")]
+    out: PathBuf,
+
+    /// Most documents in an output segment. Bounds how much is held in memory.
+    #[arg(long, default_value_t = 1_000_000)]
+    docs_per_segment: usize,
+
+    /// Suppress progress output.
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -282,6 +309,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Crawl(args) => finish(run_crawl(args)),
         Command::Index(args) => finish(run_index(&args)),
+        Command::Merge(args) => finish(run_merge(&args)),
         Command::Link(args) => finish(run_link(&args)),
         Command::Eval(args) => finish(run_eval(&args)),
         Command::Search(args) => finish(run_search(&args)),
@@ -383,6 +411,70 @@ fn run_index(args: &IndexArgs) -> Result<(), String> {
 /// Every weight in the scorer is currently a starting value chosen by reading,
 /// not by measurement, and `RESEARCH.md` §5.4 says plainly that tuning them by
 /// eye is guessing. This is how the guessing stops.
+/// Combine an index's segments.
+///
+/// A query reads every segment's dictionary and, for each term, one posting
+/// list per segment. Fewer segments is straightforwardly less work per query,
+/// and the only reason an index has several is that building one bounds
+/// memory.
+fn run_merge(args: &MergeArgs) -> Result<(), String> {
+    if args.out == args.index {
+        return Err(String::from(
+            "--out must differ from --index: merging in place would destroy the \
+             index if it failed part-way through",
+        ));
+    }
+
+    let before = build::read_manifest(&args.index).map_err(|error| {
+        format!(
+            "could not read the index at {}: {error}",
+            args.index.display()
+        )
+    })?;
+
+    let merged = merge::merge(&merge::MergeConfig {
+        index_dir: args.index.clone(),
+        out_dir: args.out.clone(),
+        docs_per_segment: args.docs_per_segment.max(1),
+        progress: !args.quiet,
+    })
+    .map_err(|error| format!("merge failed: {error}"))?;
+
+    println!();
+    println!(
+        "  segments           {} -> {}",
+        before.segments.len(),
+        merged.segments.len()
+    );
+    println!("  documents          {}", merged.documents);
+    println!("  postings           {}", merged.postings);
+    println!(
+        "  index on disk      {} -> {}",
+        human_bytes(before.bytes_total),
+        human_bytes(merged.bytes_total)
+    );
+    println!(
+        "    dictionary       {} -> {}",
+        human_bytes(before.bytes_dictionary),
+        human_bytes(merged.bytes_dictionary)
+    );
+
+    // The count is what a query actually pays: a three-word search reads three
+    // posting lists per segment.
+    println!(
+        "\n  a three-word query now reads up to {} posting lists, not {}",
+        3 * merged.segments.len(),
+        3 * before.segments.len()
+    );
+    println!("\nwritten to {}", args.out.display());
+    println!(
+        "the original is untouched at {}; swap the directories once you have \
+         checked it",
+        args.index.display()
+    );
+    Ok(())
+}
+
 fn run_eval(args: &EvalArgs) -> Result<(), String> {
     let judgments = Judgments::load(&args.judgments)
         .map_err(|error| format!("could not read the judged query set: {error}"))?;

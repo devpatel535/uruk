@@ -9,6 +9,7 @@ pub mod build;
 pub mod codec;
 pub mod fields;
 pub mod index;
+pub mod merge;
 pub mod postings;
 pub mod segment;
 pub mod tokenize;

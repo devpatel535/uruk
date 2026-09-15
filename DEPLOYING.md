@@ -92,6 +92,11 @@ uruk link --crawl /var/lib/uruk/crawl --seeds seeds.txt
 # 3. Index.
 uruk index --crawl /var/lib/uruk/crawl --out /var/lib/uruk/index
 
+# 3b. Merge the segments. Optional, and worth it: a query reads one posting
+#     list per term *per segment*, so an index left in twenty segments makes a
+#     three-word search sixty reads instead of three.
+uruk merge --index /var/lib/uruk/index --out /var/lib/uruk/index-merged
+
 # 4. Check the ranking against your judged queries, if you have written any.
 uruk eval --judgments queries.txt \
           --index /var/lib/uruk/index --crawl /var/lib/uruk/crawl
@@ -110,6 +115,8 @@ Crawl into a **new** directory, index it, and swap:
 uruk crawl --seeds seeds.txt --out /var/lib/uruk/crawl.new --max-pages 200000
 uruk link  --crawl /var/lib/uruk/crawl.new --seeds seeds.txt
 uruk index --crawl /var/lib/uruk/crawl.new --out /var/lib/uruk/index.new
+uruk merge --index /var/lib/uruk/index.new --out /var/lib/uruk/index.merged
+rm -rf /var/lib/uruk/index.new && mv /var/lib/uruk/index.merged /var/lib/uruk/index.new
 
 sudo systemctl stop uruk
 sudo mv /var/lib/uruk/crawl /var/lib/uruk/crawl.old

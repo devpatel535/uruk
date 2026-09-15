@@ -292,6 +292,73 @@ impl SegmentBuilder {
         id
     }
 
+    /// Append everything in `other` to this builder, shifting its documents.
+    ///
+    /// This is what a merge is made of. Document ids are assigned in insertion
+    /// order, so appending one segment's documents after another's keeps every
+    /// posting list sorted — the property delta encoding and the intersection
+    /// walk both depend on — provided segments are absorbed in their original
+    /// order.
+    ///
+    /// Host ids are not preserved: each segment numbered its own hosts from
+    /// zero, so they are resolved through names and renumbered. Getting this
+    /// wrong would not fail — it would silently attribute documents to the
+    /// wrong hosts and make `site:` return somebody else's pages.
+    ///
+    /// # Errors
+    ///
+    /// Propagates read errors from `other`.
+    pub fn absorb(&mut self, other: &mut SegmentReader) -> Result<(), SegmentError> {
+        let base = u32::try_from(self.docs.len()).expect("a segment holds fewer than 4 billion");
+
+        // Host ids are per segment, so build a map from the source's ids to
+        // this builder's before touching the document table.
+        let next_host = u32::try_from(self.hosts.len()).expect("hosts fit in u32");
+        let mut host_map = vec![0u32; other.host_count()];
+        let mut assigned = next_host;
+        for (source_id, slot) in host_map.iter_mut().enumerate() {
+            let id = u32::try_from(source_id).expect("hosts fit in u32");
+            let name = other.host_name(id).unwrap_or_default().to_owned();
+            *slot = if let Some(&existing) = self.hosts.get(&name) {
+                existing
+            } else {
+                self.hosts.insert(name, assigned);
+                assigned += 1;
+                assigned - 1
+            };
+        }
+
+        for doc in 0..u32::try_from(other.len()).expect("docs fit in u32") {
+            let Some(entry) = other.doc(doc) else {
+                return Err(SegmentError::Corrupt(
+                    "a document in the table could not be read".into(),
+                ));
+            };
+            self.docs.push(DocEntry {
+                host: host_map
+                    .get(entry.host as usize)
+                    .copied()
+                    .unwrap_or_default(),
+                ..entry
+            });
+        }
+
+        for field in Field::ALL {
+            self.tokens_per_field[field.index()] += other.tokens_in_field(field);
+        }
+
+        let terms: Vec<String> = other.term_list().map(|(term, _)| term.to_owned()).collect();
+        for term in terms {
+            let mut postings = other.postings(&term)?;
+            for posting in &mut postings {
+                posting.doc += base;
+            }
+            self.terms.entry(term).or_default().extend(postings);
+        }
+
+        Ok(())
+    }
+
     /// Write the segment to `path`, plus a `.json` manifest beside it.
     ///
     /// Sections are written in order and each one reports its size, because
@@ -604,6 +671,17 @@ impl SegmentReader {
             return 0.0;
         }
         self.tokens_per_field[field.index()] as f64 / self.docs.len() as f64
+    }
+
+    /// Total tokens indexed in a field across this segment.
+    ///
+    /// The numerator of [`Self::average_length`], exposed raw because a merge
+    /// has to add two segments' totals: recovering it from the average and
+    /// the document count would round-trip through a float and lose the exact
+    /// integer, which would then be wrong in the merged segment's footer and
+    /// quietly shift every BM25 length normalisation.
+    pub fn tokens_in_field(&self, field: Field) -> u64 {
+        self.tokens_per_field[field.index()]
     }
 
     /// How many documents contain `term`. The input to IDF, and cheap: it

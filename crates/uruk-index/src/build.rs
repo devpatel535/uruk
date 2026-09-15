@@ -95,7 +95,10 @@ impl IndexManifest {
         self.bytes_total as f64 / self.text_bytes as f64
     }
 
-    fn absorb(&mut self, segment: &SegmentManifest, name: String) {
+    /// Fold one written segment's totals in. Public so `merge` can build a
+    /// manifest the same way `build` does, rather than keeping a second copy
+    /// of the arithmetic that would drift from this one.
+    pub fn absorb(&mut self, segment: &SegmentManifest, name: String) {
         self.segments.push(name);
         self.documents += segment.documents;
         self.terms += segment.terms;
