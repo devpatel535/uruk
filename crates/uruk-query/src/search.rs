@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use uruk_index::build::IndexError;
 use uruk_index::fields::FieldCounts;
 use uruk_index::index::{DocRef, Index};
-use uruk_index::postings::{DocPosting, Posting};
+use uruk_index::postings::{DocPosting, Posting, PostingList};
 use uruk_index::segment::DocEntry;
 use uruk_link::Authority;
 
@@ -38,6 +38,8 @@ use crate::score::{CorpusStats, Explanation, Scorer, TermScore, Weights};
 pub enum QueryError {
     #[error("could not read the index: {0}")]
     Index(#[from] IndexError),
+    #[error("could not read positions: {0}")]
+    Positions(#[from] uruk_index::postings::DecodeError),
 }
 
 /// How to run a search.
@@ -316,28 +318,38 @@ fn search_segment(
 ///
 /// Two phases, and the second one is the interesting part. Every candidate is
 /// scored on term relevance, quality and authority. Only the best
-/// [`Pass::depth`] of them then get their proximity computed — because
-/// proximity is a small adjustment to a score those three already dominate,
-/// and computing it for every candidate was half the cost of the worst query
-/// measured.
+/// [`Pass::depth`] of them then get their positions read and their proximity
+/// computed — because proximity is a small adjustment to a score those three
+/// already dominate, and computing it for every candidate was half the cost of
+/// the worst query measured.
+///
+/// Reading positions for the survivors alone is what the position group table
+/// is for (`postings::POSITION_GROUP`): without it, "one document's positions"
+/// means decoding every position before it.
+///
+/// A **phrase** query is the exception and always will be. Whether a document
+/// contains the phrase is not a ranking adjustment, it is whether the document
+/// matches at all, so every candidate's positions have to be read before
+/// anything can be scored or cut.
 fn with_positions(
     index: &mut Index,
     segment: u16,
     pass: &Pass<'_>,
     lists_read: &mut usize,
 ) -> Result<(Vec<Hit>, usize), QueryError> {
-    let mut lists: Vec<Vec<Posting>> = Vec::with_capacity(pass.terms.len());
+    let mut lists: Vec<PostingList> = Vec::with_capacity(pass.terms.len());
     for term in pass.terms {
-        let postings = index.segment_postings(segment, term)?;
+        let list = index.segment_posting_list(segment, term)?;
         *lists_read += 1;
-        if postings.is_empty() {
+        if list.is_empty() {
             // AND: one absent term ends this segment.
             return Ok((Vec::new(), 0));
         }
-        lists.push(postings);
+        lists.push(list);
     }
 
-    let candidates = intersect(&lists);
+    let documents: Vec<&[DocPosting]> = lists.iter().map(PostingList::docs).collect();
+    let candidates = intersect_indices(&documents);
     if candidates.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -346,20 +358,42 @@ fn with_positions(
     let (excluded, exclusion_reads) = excluded_docs(index, segment, pass.query)?;
     *lists_read += exclusion_reads;
 
+    // A phrase has to be checked against every candidate, so its positions are
+    // read up front. Everything else defers them to the survivors.
+    let phrase_positions = if pass.query.phrases.is_empty() {
+        None
+    } else {
+        Some(read_positions(&lists, &candidates)?)
+    };
+
     // --- phase one: everything except proximity ---
-    let mut scored: Vec<(f64, u32, DocEntry, Vec<Posting>)> = Vec::new();
-    for (doc, postings) in candidates {
-        let Some(entry) = keep(index, segment, doc, &excluded, pass.host_filter) else {
+    let mut scored: Vec<Candidate> = Vec::new();
+    for (at, (doc, indices)) in candidates.iter().enumerate() {
+        let Some(entry) = keep(index, segment, *doc, &excluded, pass.host_filter) else {
             continue;
         };
-        // Phrases before scoring: a document that does not contain the phrase
-        // is not a match at all, so it must not occupy a rescoring slot.
-        if !satisfies_phrases(&pass.query.phrases, pass.terms, &postings) {
-            continue;
+        if let Some(positions) = &phrase_positions {
+            // Phrases before scoring: a document that does not contain the
+            // phrase is not a match at all, so it must not take a rescoring
+            // slot from one that is.
+            if !satisfies_phrases(&pass.query.phrases, pass.terms, &positions[at]) {
+                continue;
+            }
         }
-        let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
-        let without = build_hit(index, segment, doc, &entry, pass, &counts, None);
-        scored.push((without.score, doc, entry, postings));
+        let counts: Vec<FieldCounts> = indices
+            .iter()
+            .zip(&documents)
+            .map(|(&index, list): (&usize, &&[DocPosting])| list[index].counts)
+            .collect();
+        let without = build_hit(index, segment, *doc, &entry, pass, &counts, None);
+        scored.push(Candidate {
+            score: without.score,
+            doc: *doc,
+            entry,
+            counts,
+            indices: indices.clone(),
+            at,
+        });
     }
     let matched = scored.len();
 
@@ -370,17 +404,81 @@ fn with_positions(
         // `select_nth_unstable` partitions in linear time rather than sorting:
         // the order within the kept set does not matter, because every one of
         // them is about to be rescored and re-ranked anyway.
-        scored.select_nth_unstable_by(depth, |a, b| b.0.total_cmp(&a.0));
+        scored.select_nth_unstable_by(depth, |a, b| b.score.total_cmp(&a.score));
         scored.truncate(depth);
     }
+    // Back into document order, which is also ascending order in every
+    // posting list, because all of them were walked together. `positions_of`
+    // needs that to visit each position group once.
+    scored.sort_unstable_by_key(|candidate| candidate.at);
+
+    let survivors: Vec<(u32, Vec<usize>)> = scored
+        .iter()
+        .map(|candidate| (candidate.doc, candidate.indices.clone()))
+        .collect();
+    let positions = match &phrase_positions {
+        // Already read, for the phrase check.
+        Some(all) => scored.iter().map(|c| all[c.at].clone()).collect(),
+        None => read_positions(&lists, &survivors)?,
+    };
 
     let mut hits = Vec::with_capacity(scored.len());
-    for (_, doc, entry, postings) in scored {
-        let counts: Vec<FieldCounts> = postings.iter().map(|p| p.counts).collect();
-        let span = closest_span(&postings.iter().map(|p| &p.positions).collect::<Vec<_>>());
-        hits.push(build_hit(index, segment, doc, &entry, pass, &counts, span));
+    for (candidate, positions) in scored.iter().zip(&positions) {
+        let span = closest_span(&positions.iter().collect::<Vec<_>>());
+        hits.push(build_hit(
+            index,
+            segment,
+            candidate.doc,
+            &candidate.entry,
+            pass,
+            &candidate.counts,
+            span,
+        ));
     }
     Ok((hits, matched))
+}
+
+/// A document that matched, carried between the two scoring phases.
+struct Candidate {
+    /// The score without proximity, which is what phase two selects on.
+    score: f64,
+    doc: u32,
+    entry: DocEntry,
+    counts: Vec<FieldCounts>,
+    /// Where this document sits in each term's posting list.
+    indices: Vec<usize>,
+    /// Where it sits among the candidates, for looking up positions already
+    /// read for a phrase check.
+    at: usize,
+}
+
+/// Positions for a set of documents, per term.
+///
+/// Indexed `[document][term]`, which is the shape both the phrase check and
+/// the proximity calculation want. Each term's list is read in one pass, so
+/// every position group is decoded at most once however many documents fall
+/// inside it.
+fn read_positions(
+    lists: &[PostingList],
+    wanted: &[(u32, Vec<usize>)],
+) -> Result<Vec<Vec<Vec<u32>>>, QueryError> {
+    let mut per_term = Vec::with_capacity(lists.len());
+    for (term, list) in lists.iter().enumerate() {
+        let indices: Vec<usize> = wanted.iter().map(|(_, ix)| ix[term]).collect();
+        per_term.push(list.positions_of(&indices)?);
+    }
+
+    // Transpose: read per term, used per document.
+    let mut out = Vec::with_capacity(wanted.len());
+    for document in 0..wanted.len() {
+        out.push(
+            per_term
+                .iter()
+                .map(|term| term[document].clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(out)
 }
 
 /// The path for queries that cannot use positions: one term, no phrase.
@@ -532,18 +630,18 @@ fn excluded_docs(
 ///
 /// `postings` is one posting per entry of `terms`, in the same order, which is
 /// what the intersection produced.
-fn satisfies_phrases(phrases: &[Vec<String>], terms: &[&str], postings: &[Posting]) -> bool {
+fn satisfies_phrases(phrases: &[Vec<String>], terms: &[&str], positions: &[Vec<u32>]) -> bool {
     phrases.iter().all(|phrase| {
-        let positions: Option<Vec<&Vec<u32>>> = phrase
+        let found: Option<Vec<&Vec<u32>>> = phrase
             .iter()
             .map(|term| {
                 terms
                     .iter()
                     .position(|candidate| *candidate == term.as_str())
-                    .map(|at| &postings[at].positions)
+                    .map(|at| &positions[at])
             })
             .collect();
-        positions.is_some_and(|found| phrase_matches(&found))
+        found.is_some_and(|found| phrase_matches(&found))
     })
 }
 
@@ -552,6 +650,54 @@ fn satisfies_phrases(phrases: &[Vec<String>], terms: &[&str], postings: &[Postin
 /// An n-way walk rather than repeated set intersection: the lists are sorted
 /// by document id, so all of them advance together and nothing is allocated
 /// per candidate that is then thrown away.
+/// Documents present in every list, as each list's *index* for them.
+///
+/// The same n-way walk as [`intersect`], but returning where each document
+/// sits in each list rather than a copy of its posting. That is what a lazy
+/// read needs: the position groups are addressed by index, and copying
+/// postings to throw most of them away was the thing worth avoiding.
+fn intersect_indices(lists: &[&[DocPosting]]) -> Vec<(u32, Vec<usize>)> {
+    if lists.is_empty() || lists.iter().any(|list| list.is_empty()) {
+        return Vec::new();
+    }
+    let mut cursors = vec![0usize; lists.len()];
+    let mut out = Vec::new();
+
+    loop {
+        // The largest document any list is currently at. Everything below it
+        // can be skipped, because AND cannot be satisfied there.
+        let mut target = 0u32;
+        for (list, &cursor) in lists.iter().zip(&cursors) {
+            match list.get(cursor) {
+                Some(posting) => target = target.max(posting.doc),
+                None => return out,
+            }
+        }
+
+        let mut aligned = true;
+        for (list, cursor) in lists.iter().zip(&mut cursors) {
+            while list
+                .get(*cursor)
+                .is_some_and(|posting| posting.doc < target)
+            {
+                *cursor += 1;
+            }
+            match list.get(*cursor) {
+                Some(posting) if posting.doc == target => {}
+                Some(_) => aligned = false,
+                None => return out,
+            }
+        }
+
+        if aligned {
+            out.push((target, cursors.clone()));
+            for cursor in &mut cursors {
+                *cursor += 1;
+            }
+        }
+    }
+}
+
 /// A posting the intersection can walk, with or without its positions.
 ///
 /// The walk only ever looks at document ids, so it does not need to know which

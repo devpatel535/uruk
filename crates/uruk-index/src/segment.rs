@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::fields::{FIELD_COUNT, Field, FieldCounts, FieldLengths};
-use crate::postings::{self, DocPosting, Posting, read_varint, write_varint};
+use crate::postings::{self, DocPosting, Posting, PostingList, read_varint, write_varint};
 use crate::tokenize::{self, Token};
 
 /// Positions left empty between one field and the next.
@@ -81,7 +81,10 @@ const MAGIC: &[u8; 8] = b"URUKIDX1";
 /// - 3: postings split into separate document-id, frequency and position
 ///   streams so block codecs have runs long enough to pay off, with the field
 ///   mask written only for postings that touch a field other than the body.
-const FORMAT_VERSION: u32 = 3;
+/// - 4: positions cut into independently decodable groups with a byte-length
+///   table, so a reader can fetch one document's positions without decoding
+///   every position before it.
+const FORMAT_VERSION: u32 = 4;
 /// 4 section offsets + term count + 4 corpus totals + doc count + magic.
 const FOOTER_LEN: u64 = 8 * 5 + 8 * FIELD_COUNT as u64 + 4 + 8;
 
@@ -646,6 +649,21 @@ impl SegmentReader {
                 term: term.to_owned(),
                 source,
             }
+        })
+    }
+
+    /// One term's postings with the positions left unread until asked for.
+    ///
+    /// The shape the query path wants: it needs every candidate's frequencies
+    /// to rank them, and only the survivors' positions.
+    pub fn posting_list(&mut self, term: &str) -> Result<PostingList, SegmentError> {
+        let Some(bytes) = self.posting_bytes(term)? else {
+            return Ok(PostingList::default());
+        };
+        let mut cursor = 0;
+        postings::decode_list(&bytes, &mut cursor).map_err(|source| SegmentError::BadPostings {
+            term: term.to_owned(),
+            source,
         })
     }
 

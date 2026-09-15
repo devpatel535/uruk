@@ -964,6 +964,13 @@ at 3.41, so the prediction was right in direction and slightly pessimistic in
 size — the first honest prediction in this section, after the estimate at the
 top of it was wrong by a third.
 
+**Since amended, deliberately.** §6b later added a skip table to the position
+stream, which buys a large latency win and costs **2.1% of index size**: 3.41
+to **3.48 bytes per posting**, 3,951 to **3,990 bytes per page**. That is the
+trade taken with its eyes open, and the page figure is still inside the 4 KB
+target set below. The numbers in the table above are the Phase 5 result on its
+own, kept as the record of what the restructuring alone was worth.
+
 **What this means in general**, and it is the most transferable thing in this
 document: *the data layout dominated the entropy coder by roughly an order of
 magnitude.* The best codec swap available was worth 5 percentage points of
@@ -991,8 +998,9 @@ Against the brief's hope of 15–25% of raw text, the honest position is:
 
 I restated the goal as a number that can be checked on every build: **under
 4 KB on disk per indexed page, everything included.** It was 5.2 KB. It is now
-**3,951 bytes**, so that target is met, with the crawl store — not the index —
-now the larger half.
+**3,990 bytes**, so that target is met — though with the position skip table
+added it is met by 10 bytes rather than 49, and the next thing that wants a
+per-posting byte will break it.
 
 | Corpus | Store + index today | Fits where |
 |---|---|---|
@@ -1137,45 +1145,82 @@ The `exact proximity` column stays, and `uruk eval` can switch between the two,
 so the day somebody has a real judged query set the cost of this approximation
 is a command rather than an argument.
 
-### What is left, and why it is two changes rather than one
+### Fixing the second half: skip pointers into the position stream
 
-The remaining 91.4ms decomposes. A single 100,000-posting list reads in 23.6ms
-without positions, and this query reads two of them, so roughly **45ms is
-reading document ids and frequencies and scoring 84,234 candidates**, and the
-other **~46ms is decoding position streams**.
+The remaining 91.4ms decomposed. A single 100,000-posting list reads in 23.6ms
+without positions and this query reads two, so roughly **45ms was reading
+document ids and frequencies and scoring 84,234 candidates**, and the other
+**~46ms was decoding position streams**.
 
-Both have known fixes, and it is worth being precise that neither is sufficient
-alone:
+The two-phase scoring above knew exactly which hundred documents it wanted and
+had no way to ask for only those, because a position stream is sequential: to
+read one document's positions you must decode every position before it.
 
-1. **Skip pointers into the position stream.** Even to read one document's
-   positions the stream must be decoded from its start, because it is
-   sequential by construction — the two-phase scoring above knows exactly which
-   hundred documents it wants and has no way to ask for only those. Grouping
-   positions by blocks of documents with a byte offset per block is the
-   standard answer, and it is what Lucene's skip lists are for. It is a change
-   to the on-disk format. Optimistically it removes most of the 46ms.
+So the stream is now cut into independently decodable groups of 128 documents,
+with a table of byte lengths written before them. A reader jumps to the group
+it wants and decodes at most 127 other documents' positions to get there. This
+is what Lucene's skip lists are for, and it is a change to the on-disk format
+(version 4).
 
-2. **Top-k pruning — block-max WAND.** That still leaves ~45ms of reading and
-   scoring every candidate, which no amount of position cleverness touches.
-   Storing a maximum score per block of postings lets the traversal skip whole
-   blocks that cannot contain a top-ten result. This is the larger lever and
-   the more intrusive change.
+| case | one phase | two phase | **with skip groups** |
+|---|---|---|---|
+| **two common terms** | 175.8ms | 91.4ms | **25.6ms** |
+| common + rare | 37.9ms | 32.9ms | **5.6ms** |
+| phrase | 96.9ms | 79.0ms | **59.7ms** |
+| commonest term | 88.8ms | 23.6ms | 17.0ms |
+| `site:` filter | 55.3ms | 6.0ms | 4.5ms |
+| rare term | 0.1ms | 0.1ms | 0.0ms |
 
-The arithmetic, so nobody plans on the wrong one: at a million documents the
-worst case is about 900ms. Skip pointers alone would bring it to roughly 500ms.
-Both together get under 200ms. An earlier draft of this section called skip
-pointers "the single remaining fix", which was wrong in a way that would have
-sent somebody down the shorter road first.
+I expected this to take the worst case to about 50ms. It took it to 25.6ms,
+because the win compounds with the two-phase cut in a way I had not costed:
+`common + rare` went from 32.9ms to 5.6ms, a six-fold improvement rather than
+a two-fold one, because 262 matching documents out of a 100,000-posting list
+touch a hundred groups instead of all 782.
 
-Neither is written.
+**What it costs on disk: 2.1%.** Every posting list pays a varint for the group
+count and one per group. On a 100,000-document index that is 3.41 to 3.48 bytes
+per posting, and 3,951 to 3,990 bytes per page. Worth stating plainly because
+this repository has spent a lot of effort on those bytes, and this gives some
+of them back on purpose.
+
+**What it does not help is phrases**, and that is inherent rather than a gap.
+Whether a document contains a phrase is not a ranking adjustment that can wait
+for the top hundred — it is whether the document matches at all, so every
+candidate's positions have to be read. A phrase query over two very common
+terms genuinely requires the position data for every co-occurrence. Skip groups
+still help it somewhat (79.0ms to 59.7ms) because the groups are decoded once
+each rather than the whole stream being walked per document, but there is no
+version of this where a phrase over the two commonest words in a corpus is
+cheap.
+
+### What is left
+
+Scoring is now the largest remaining cost: reading document ids and
+frequencies for every candidate and scoring all 84,234 of them. No amount of
+position cleverness touches it. The fix is **top-k pruning** — storing a
+maximum score bound per block of postings so the traversal can skip blocks that
+cannot contain a top-ten result, in the block-max family. It is the more
+intrusive change and it is not written.
+
+Note that the worst case has changed identity. At a million documents:
+
+| case | projected |
+|---|---|
+| phrase over two common terms | ~620ms |
+| two common terms | ~265ms |
+| commonest term | ~170ms |
+| everything else | under 60ms |
+
+The phrase is now the binding case, and it is the one that pruning helps least,
+because its candidate set is not a ranking artefact — it is the answer.
 
 ### Where principle 4 actually stands
 
 | | promise | measured |
 |---|---|---|
 | Index size | "small on disk" | **met** — 29% of text with positions, 3,951 bytes per page, stable from 20k to 100k documents |
-| Latency, 100k documents | sub-200ms | **met**, worst case 98.5ms — half the budget |
-| Latency, 1M documents | sub-200ms | **not met for the worst case** — about 900ms, so roughly a factor of five |
+| Latency, 100k documents | sub-200ms | **met**, worst case 62.4ms — under a third of the budget |
+| Latency, 1M documents | sub-200ms | **not met for two cases** — a phrase over two very common terms (~620ms) and two very common terms (~265ms). Everything else fits |
 
 The worst case is two *very* common terms — in this corpus the rank-1 term
 appears in every document, which is what "the" does in English. The engine
@@ -1186,13 +1231,17 @@ documents and would answer in about a millisecond at ten million.
 
 Two honest readings, and both belong here:
 
-- **The budget holds today** for any corpus up to roughly 200,000 documents,
-  which is more than a self-hosted topical index is likely to be.
-- **The budget does not hold at the scale the rest of the design is sized
-  for**, and getting there needs both of the changes named above, not one.
+- **The budget holds today** for any corpus up to roughly 300,000 documents,
+  and to about three million for every query that is not a phrase over two of
+  the commonest words in the language.
+- **It still does not hold for those two cases at a million documents**, and
+  the change that would help most — top-k pruning — is named above and not
+  written.
 
-Halving the worst case twice over — 176ms to 98.5ms, on top of 88.8ms to 23.1ms
-for the common cases — came from measuring first and changing second. The
+The worst case went 176ms to 98.5ms to 26.5ms, and the common cases 88.8ms to
+17.0ms, in three steps that each came from measuring first and changing second.
+Two of the three were not what I would have guessed: the codec was not the
+lever in §6, and skip groups were worth twice what I costed them at here. The
 benchmark that only reports the cases that pass would have been easier to write
 and worth nothing.
 

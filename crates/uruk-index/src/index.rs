@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::build::{IndexError, IndexManifest, read_manifest};
 use crate::fields::Field;
-use crate::postings::{DocPosting, Posting};
+use crate::postings::{DocPosting, Posting, PostingList};
 use crate::segment::{DocEntry, SegmentReader};
 
 /// Where a document lives: which segment, and its id inside it.
@@ -166,6 +166,22 @@ impl Index {
             return Ok(Vec::new());
         }
         Ok(reader.postings(term)?)
+    }
+
+    /// One term's postings from one segment, with positions readable on
+    /// demand rather than decoded up front.
+    pub fn segment_posting_list(
+        &mut self,
+        segment: u16,
+        term: &str,
+    ) -> Result<PostingList, IndexError> {
+        let Some(reader) = self.segments.get_mut(segment as usize) else {
+            return Ok(PostingList::default());
+        };
+        if reader.doc_frequency(term) == 0 {
+            return Ok(PostingList::default());
+        }
+        Ok(reader.posting_list(term)?)
     }
 
     /// One term's postings from one segment, without decoding positions.

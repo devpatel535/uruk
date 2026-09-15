@@ -49,12 +49,12 @@ not survive contact with the 2026 web.
 Named here rather than discovered later. Each has a section in `RESEARCH.md`
 explaining the reasoning, and none of them is a to-do that was forgotten.
 
-- **Sub-200ms at a million pages, worst case.** The budget holds to roughly
-  200,000 documents (worst case 98.5ms, measured). At a million the worst case
-  — two very common terms — is about 900ms. Two changes would fix it, skip
-  pointers into the position stream and block-max WAND, and
+- **Sub-200ms at a million pages, for two query shapes.** The budget holds to
+  roughly 300,000 documents (worst case 62.4ms, measured), and to about three
+  million for anything that is not a phrase over two extremely common words.
+  Top-k pruning is what would close the rest;
   [§6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
-  has the arithmetic for why it needs both.
+  has the projection.
 - **A real judged query set.** The harness exists; the judgments are a human
   judgement about a specific corpus and cannot be generated. See
   `crates/uruk-eval/examples/judgments.example.txt`.
@@ -150,7 +150,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 377 tests
+cargo test --workspace          # 380 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -170,14 +170,13 @@ proximity intact. Both numbers print on every run, so a change that makes the
 index fatter is visible immediately.
 
 `query_bench` measures the other half of principle 4. At 100,000 documents
-every case is inside the 200ms budget with the worst at **98.5ms**, down from
+every case is inside the 200ms budget with the worst at **62.4ms**, down from
 176ms when it was first measured. The work is linear in corpus size, so the
-budget holds to roughly 200,000 documents and the worst case would still miss
-it at a million. [RESEARCH.md
+budget holds to roughly 300,000 documents — and to about three million for
+every query that is not a phrase over two of the commonest words in the
+language. [RESEARCH.md
 §6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked)
-has the breakdown, what was fixed, and the two changes still needed to hold the
-budget at a million pages — skip pointers into the position stream and
-block-max WAND — neither of which is written.
+has the breakdown, the three fixes so far, and the one still outstanding.
 
 ## Running your own
 
