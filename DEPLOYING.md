@@ -43,6 +43,90 @@ writing down what anybody asked.
 
 ---
 
+## What this costs to run
+
+**The software costs nothing and has no way to start costing something.** Every
+dependency is permissive open source; there are no API keys anywhere, no
+managed database, no CDN, no analytics service, no email sender, no auth
+provider. That is not thrift, it is the principles: no ads means no ad
+server, no tracking means no analytics subscription, no JavaScript means no
+CDN, and no accounts means nothing to send a password reset from. A normal web
+product's recurring bill is mostly things this engine is not allowed to have.
+
+What is left is a computer, some disk, and some bandwidth.
+
+| Resource | Measured | For 100,000 pages | For 1,000,000 |
+|---|---|---|---|
+| Disk, store + index | 3,990 bytes/page | **0.4 GB** | 3.7 GB |
+| Indexing | 1,040 pages/second | ~2 minutes | ~16 minutes |
+| Query, worst case | 65ms at 100k docs | comfortable | see [§6b](RESEARCH.md#6b-fast-to-search-measured--and-the-half-of-principle-4-nobody-had-checked) |
+| Binary | — | 7.6 MB | 7.6 MB |
+
+Memory is not the constraint it looks like. Posting lists are read per query
+rather than held resident, so serving wants very little. Indexing holds one
+segment's postings — about 85 MB at the default 50,000 documents per segment —
+plus the anchor-text map, which is bounded by the size of the crawl rather
+than by the number of links in it (roughly 12 MB of URL hashes per million
+pages, plus a few hundred bytes for each page other sites actually describe).
+
+**A 100,000-page index runs on a Raspberry Pi.** It is 0.4 GB on disk and
+answers every query shape in well under a tenth of a second.
+
+### The one thing that is not free
+
+**Bandwidth, while crawling.** Roughly 50 GB per million pages fetched. On
+home broadband that is usually unremarkable; on a metered or capped
+connection it is the whole budget. `--max-pages` bounds it directly, and a
+100,000-page crawl is about 5 GB.
+
+Two non-monetary costs worth pricing in the same breath. Crawling from a
+residential address risks the address being blocked by sites that do not
+expect a crawler there — the politeness defaults exist partly for that. And a
+judged query set costs hours of somebody's attention rather than money, which
+does not make it cheap.
+
+### Not hosting it at all
+
+The cheapest public deployment is not a deployment. A 100,000-page topical
+index is **0.4 GB**, which is small enough to distribute as a file: people
+download it, run `uruk serve`, and search it locally. No server, no domain, no
+TLS certificate, no bandwidth beyond the download, and nothing to keep running
+or patch.
+
+It also happens to be the strongest version of the privacy promise. A search
+that never leaves the machine cannot be logged by a reverse proxy, which is
+the failure mode the top of this file is about.
+
+[RESEARCH.md §6](RESEARCH.md#6-what-small-on-disk-actually-means-in-numbers)
+argues this is realistic up to about 1–10 million pages and stops being
+realistic above that. If you are starting with no budget, start here — a
+public instance can come later and nothing about the corpus has to change.
+
+### If you do want it on the public internet for nothing
+
+Be careful with free hosting tiers, and not mainly because of the price:
+
+- **Most forbid crawlers outright.** Running a crawler on a platform whose
+  terms prohibit it is a way to lose the account and the corpus with it.
+- **Most give no persistent disk.** An index is a file. A platform that
+  resets the filesystem on every deploy will lose it, and rebuilding means
+  re-crawling.
+- **Egress is usually the metered thing**, and serving search results is
+  egress.
+
+A realistic split is to **crawl and index on a machine you own**, where none
+of those apply, and put only the serving half somewhere else — that part needs
+a few hundred megabytes of disk and almost no CPU. Whether any particular
+free tier allows even that changes often enough that this file will not name
+one; read the current terms rather than trusting a document.
+
+**A domain is not required.** Nothing in this engine needs one. The crawler
+identifies itself by the repository URL, which is what the `/crawler` page
+needs to be true about. Registering a name is a decision to make when there is
+something at the end of it, not a prerequisite.
+
+---
+
 ## Layout
 
 ```

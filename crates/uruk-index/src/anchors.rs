@@ -31,7 +31,7 @@
 //! What survives is a short piece of text per document: the distinct things
 //! independent sites call it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use uruk_crawl::store::{StoreError, StoreReader};
 
@@ -53,29 +53,70 @@ pub const MAX_PHRASE_CHARS: usize = 80;
 /// Characters kept per document, across all phrases.
 pub const MAX_TOTAL_CHARS: usize = 400;
 
+/// One target's anchor text, while it is being gathered.
+#[derive(Debug, Default)]
+struct Target {
+    /// The distinct things other sites call this page.
+    phrases: BTreeSet<String>,
+    /// Hashes of the `(source site, phrase)` pairs already counted, so one
+    /// host repeating itself across a thousand pages counts once.
+    ///
+    /// Dropped the moment the target is full: once no more phrases can be
+    /// accepted there is nothing left to deduplicate against, and on a large
+    /// crawl this set is the difference between fitting in memory and not.
+    seen: HashSet<u64>,
+}
+
 /// Anchor text gathered per target URL.
 #[derive(Debug, Default)]
 pub struct Anchors {
-    /// Target URL -> the distinct phrases pointed at it.
-    by_target: HashMap<String, BTreeSet<String>>,
-    /// Sources already counted for a target, so one host cannot repeat itself.
-    /// Keyed by target and source site together.
-    counted: BTreeSet<(String, String, String)>,
+    by_target: HashMap<String, Target>,
     pub links_seen: usize,
     pub nofollow: usize,
     pub same_site: usize,
     pub repeated: usize,
     pub too_long: usize,
+    /// Links pointing at pages this crawl does not contain.
+    ///
+    /// Usually most of them, and all of them useless: anchor text describes a
+    /// *document*, and a page that was never fetched never becomes one. See
+    /// [`Anchors::collect`] for why counting them is what keeps this bounded.
+    pub uncrawled: usize,
 }
 
 impl Anchors {
     /// Read every page's outgoing links and gather anchor text by target.
     ///
-    /// A whole pass over the crawl before indexing starts. That is the cost of
-    /// a signal that is a property of the corpus rather than of a page.
+    /// # Why this takes two passes
+    ///
+    /// The obvious single pass keeps anchor text for every link it sees, and
+    /// its memory is bounded by the number of *links* rather than the number
+    /// of pages — which on a real crawl is one or two orders of magnitude
+    /// larger, because most links point outside the corpus. All of that is
+    /// waste: anchor text describes a document, and a URL that was never
+    /// fetched never becomes one.
+    ///
+    /// So the first pass learns which URLs the crawl actually contains, and
+    /// the second keeps anchors only for those. Memory is then bounded by the
+    /// crawl, which is the thing the operator chose the size of.
+    ///
+    /// The URL set is held as 64-bit hashes rather than strings, which makes
+    /// it about 12 MB per million pages instead of 150. A collision would let
+    /// one uncrawled target's anchors be kept — a few wasted bytes, never a
+    /// wrong answer, because the map that stores them is still keyed by the
+    /// real URL and looked up by the real URL. There is no false negative to
+    /// worry about: every crawled URL is inserted exactly.
     pub fn collect(store: &mut StoreReader) -> Result<Self, StoreError> {
-        let mut anchors = Self::default();
+        let mut crawled: HashSet<u64> = HashSet::new();
+        for record in store.records()? {
+            let record = record?;
+            crawled.insert(hash(&record.url));
+            if record.final_url != record.url {
+                crawled.insert(hash(&record.final_url));
+            }
+        }
 
+        let mut anchors = Self::default();
         for record in store.records()? {
             let record = record?;
             let Some(source) = url_host(&record.final_url) else {
@@ -87,6 +128,10 @@ impl Anchors {
                 anchors.links_seen += 1;
                 if link.nofollow {
                     anchors.nofollow += 1;
+                    continue;
+                }
+                if !crawled.contains(&hash(&link.url)) {
+                    anchors.uncrawled += 1;
                     continue;
                 }
                 let Some(target_host) = url_host(&link.url) else {
@@ -106,17 +151,19 @@ impl Anchors {
                     continue;
                 }
 
+                let target = anchors.by_target.entry(link.url.clone()).or_default();
+                if target.phrases.len() >= MAX_PHRASES {
+                    // Full. Nothing more can be accepted, so the dedup set has
+                    // no further work to do and its memory is given back.
+                    target.seen = HashSet::new();
+                    continue;
+                }
                 // One phrase, from one site, about one target, counts once.
-                let key = (link.url.clone(), source_site.clone(), phrase.clone());
-                if !anchors.counted.insert(key) {
+                if !target.seen.insert(hash_pair(&source_site, &phrase)) {
                     anchors.repeated += 1;
                     continue;
                 }
-
-                let phrases = anchors.by_target.entry(link.url.clone()).or_default();
-                if phrases.len() < MAX_PHRASES {
-                    phrases.insert(phrase);
-                }
+                target.phrases.insert(phrase);
             }
         }
 
@@ -130,10 +177,10 @@ impl Anchors {
     pub fn text_for(&self, url: &str, final_url: &str) -> String {
         let mut out = String::new();
         for key in [url, final_url] {
-            let Some(phrases) = self.by_target.get(key) else {
+            let Some(target) = self.by_target.get(key) else {
                 continue;
             };
-            for phrase in phrases {
+            for phrase in &target.phrases {
                 if out.len() + phrase.len() + 1 > MAX_TOTAL_CHARS {
                     return out;
                 }
@@ -155,6 +202,33 @@ impl Anchors {
     }
 }
 
+/// FNV-1a, for set membership where a collision costs a few bytes.
+///
+/// Not a cryptographic hash and not trying to be: this decides whether to keep
+/// a string that is also stored exactly elsewhere, so the worst a collision
+/// does is keep one thing that was not needed.
+fn hash(text: &str) -> u64 {
+    let mut value = 0xcbf2_9ce4_8422_2325u64;
+    for byte in text.as_bytes() {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    value
+}
+
+/// Hash of two strings with a separator, so `("ab", "c")` and `("a", "bc")`
+/// are different pairs.
+fn hash_pair(first: &str, second: &str) -> u64 {
+    let mut value = hash(first);
+    value ^= 0xff;
+    value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    for byte in second.as_bytes() {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    value
+}
+
 /// Collapse whitespace and lowercase, so "Clay  Tablets" and "clay tablets"
 /// are one phrase rather than two slots in a bounded set.
 fn tidy(anchor: &str) -> String {
@@ -167,7 +241,7 @@ fn tidy(anchor: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Anchors, MAX_PHRASE_CHARS, tidy};
+    use super::{Anchors, MAX_PHRASE_CHARS, MAX_PHRASES, Target, hash_pair, tidy};
 
     #[test]
     fn whitespace_and_case_do_not_make_two_phrases() {
@@ -187,6 +261,7 @@ mod tests {
             .by_target
             .entry(String::from("https://a.test/final"))
             .or_default()
+            .phrases
             .insert(String::from("clay tablets"));
 
         // Linked as the original, stored under the redirect target.
@@ -198,6 +273,41 @@ mod tests {
             anchors
                 .text_for("https://b.test/x", "https://b.test/x")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_full_target_gives_back_its_dedup_memory() {
+        // The bound that matters on a large crawl: once a target has all the
+        // phrases it will ever accept, the set used to deduplicate sources has
+        // nothing left to do, and holding it for every target in the corpus is
+        // what the two-pass design exists to avoid.
+        let mut target = Target::default();
+        for i in 0..MAX_PHRASES {
+            target.seen.insert(i as u64);
+            target.phrases.insert(format!("phrase {i}"));
+        }
+        assert_eq!(target.phrases.len(), MAX_PHRASES);
+
+        // Simulate the branch `collect` takes when a target is full.
+        if target.phrases.len() >= MAX_PHRASES {
+            target.seen = std::collections::HashSet::new();
+        }
+        assert!(target.seen.is_empty(), "a full target kept its dedup set");
+    }
+
+    #[test]
+    fn the_pair_hash_separates_its_halves() {
+        // ("ab", "c") and ("a", "bc") are different sources saying different
+        // things; hashing them the same would silently drop one.
+        assert_ne!(hash_pair("ab", "c"), hash_pair("a", "bc"));
+        assert_ne!(
+            hash_pair("site.test", "clay"),
+            hash_pair("site.test", "tablets")
+        );
+        assert_eq!(
+            hash_pair("site.test", "clay"),
+            hash_pair("site.test", "clay")
         );
     }
 

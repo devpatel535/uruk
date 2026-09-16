@@ -127,9 +127,11 @@ pub fn build(config: &IndexConfig) -> Result<IndexManifest, IndexError> {
     if config.progress {
         eprintln!(
             "uruk-index: {} documents described by other sites \
-             ({} links, {} same-site, {} repeats, {} nofollow, {} over-long)",
+             ({} links, {} outside the crawl, {} same-site, {} repeats, \
+             {} nofollow, {} over-long)",
             anchors.described(),
             anchors.links_seen,
+            anchors.uncrawled,
             anchors.same_site,
             anchors.repeated,
             anchors.nofollow,

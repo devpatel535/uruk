@@ -151,7 +151,7 @@ Requires Rust 1.94 or newer; `rust-toolchain.toml` pins the version.
 
 ```sh
 cargo build --release
-cargo test --workspace          # 407 tests
+cargo test --workspace          # 409 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -183,8 +183,11 @@ block-max pruning — turns out not to apply to what is left.
 ## Running your own
 
 [`DEPLOYING.md`](DEPLOYING.md) is the operational guide: a hardened systemd
-unit, a Dockerfile, disk sizing from the measured numbers, and the refresh
-procedure.
+unit, a Dockerfile, disk sizing from the measured numbers, the refresh
+procedure, and [what it costs to run](DEPLOYING.md#what-this-costs-to-run) —
+which is nothing but a computer and some bandwidth, because a design with no
+ads, no tracking, no accounts and no JavaScript has nowhere to put a
+subscription.
 
 Read the first section of it before anything else. The single most likely way
 to break the privacy promise is not in this code — it is the reverse proxy in
